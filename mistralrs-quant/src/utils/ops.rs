@@ -2289,8 +2289,19 @@ fn fused_glu_cuda(a: &Tensor, b: &Tensor, activation: GluActivationType) -> Resu
 /// Metal implementation of fused GLU
 #[cfg(feature = "metal")]
 fn fused_glu_metal(a: &Tensor, b: &Tensor, activation: GluActivationType) -> Result<Tensor> {
-    let n_elements = a.elem_count();
     let dtype = a.dtype();
+
+    // BF16 fallback: the fused_glu_bfloat Metal kernel requires Metal Shading Language 3.1+
+    // (Apple M3/A17 Pro or later). The precompiled metallib is built with -std=metal3.0,
+    // so fused_glu_bfloat is never included. Cast through F16 instead.
+    if dtype == DType::BF16 {
+        let a_f16 = a.to_dtype(DType::F16)?;
+        let b_f16 = b.to_dtype(DType::F16)?;
+        let result = fused_glu_metal(&a_f16, &b_f16, activation)?;
+        return result.to_dtype(DType::BF16);
+    }
+
+    let n_elements = a.elem_count();
     let shape = a.shape().clone();
 
     let (a_storage, a_layout) = a.storage_and_layout();
