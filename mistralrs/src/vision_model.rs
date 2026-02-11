@@ -35,6 +35,7 @@ pub struct VisionModelBuilder {
     pub(crate) device: Option<Device>,
     pub(crate) matformer_config_path: Option<PathBuf>,
     pub(crate) matformer_slice_name: Option<String>,
+    pub(crate) organization: IsqOrganization,
 
     // Model running
     pub(crate) topology: Option<Topology>,
@@ -90,6 +91,7 @@ impl VisionModelBuilder {
             device: None,
             matformer_config_path: None,
             matformer_slice_name: None,
+            organization: IsqOrganization::Default,
             prefix_cache_n: None,
         }
     }
@@ -205,6 +207,12 @@ impl VisionModelBuilder {
     /// Use ISQ of a certain type. If there is an overlap, the topology type is used over the ISQ type.
     pub fn with_isq(mut self, isq: IsqType) -> Self {
         self.isq = Some(isq);
+        self
+    }
+
+    /// Organize ISQ to enable MoQE (Mixture of Quantized Experts, <https://arxiv.org/abs/2310.02410>)
+    pub fn with_mixture_qexperts_isq(mut self) -> Self {
+        self.organization = IsqOrganization::MoeExpertsOnly;
         self
     }
 
@@ -331,6 +339,10 @@ impl UqffVisionModelBuilder {
     /// - Token source is from the cache (.cache/huggingface/token)
     /// - Maximum number of sequences running is 32
     /// - Automatic device mapping with model defaults according to `AutoDeviceMapParams`
+    ///
+    /// For sharded UQFF models, you only need to specify the first shard file
+    /// (e.g., `q4k-0.uqff`). The remaining shards are auto-discovered from the
+    /// same directory or Hugging Face repository.
     pub fn new(model_id: impl ToString, uqff_file: Vec<PathBuf>) -> Self {
         let mut inner = VisionModelBuilder::new(model_id);
         inner.from_uqff = Some(uqff_file);

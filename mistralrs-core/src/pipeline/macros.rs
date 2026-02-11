@@ -295,11 +295,36 @@ macro_rules! get_uqff_paths {
             revision.clone(),
         ));
 
-        let mut files = Vec::new();
-        for file in $from_uqff {
-            let file = file.display().to_string();
+        // Auto-discover UQFF shard siblings
+        let available_files =
+            $crate::pipeline::hf::list_repo_files(&api, Path::new(&$this.model_id), false)
+                .unwrap_or_default();
 
-            files.push(api_get_file!(api, &file, Path::new(&$this.model_id)));
+        let input_files: Vec<String> = $from_uqff.iter().map(|f| f.display().to_string()).collect();
+        let input_count = input_files.len();
+
+        let mut expanded_files: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for file_str in &input_files {
+            let expanded = $crate::pipeline::isq::expand_uqff_shards(file_str, &available_files);
+            for f in expanded {
+                if seen.insert(f.clone()) {
+                    expanded_files.push(f);
+                }
+            }
+        }
+
+        if expanded_files.len() > input_count {
+            tracing::info!(
+                "Auto-discovered {} UQFF shard files (from {} specified)",
+                expanded_files.len(),
+                input_count
+            );
+        }
+
+        let mut files = Vec::new();
+        for file in &expanded_files {
+            files.push($crate::api_get_file!(api, file, Path::new(&$this.model_id)));
         }
         files
     }};
@@ -559,12 +584,17 @@ macro_rules! vision_normal_model_loader {
         $loading_uqff:expr,
         $real_device:expr,
         $attention_mechanism:expr,
+        $is_moqe:expr,
         $multi_progress:expr,
         $matformer_config:expr,
     ) => {{
         let regexes = if $loading_isq && $loading_uqff {
             // Dummy weights for the layers which will be overwritten...
-            Some(std::sync::Arc::new($loader.isq_layer_regexes(&$config)?))
+            Some(std::sync::Arc::new(if $is_moqe {
+                $loader.isq_layer_regexes_moqe(&$config)?
+            } else {
+                $loader.isq_layer_regexes(&$config)?
+            }))
         } else {
             None
         };
