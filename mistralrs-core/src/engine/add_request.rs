@@ -143,7 +143,7 @@ impl Engine {
         ));
 
         let image_generation_format = match &request.messages {
-            RequestMessage::ImageGeneration { format, .. } => Some(*format),
+            RequestMessage::ImageGeneration { format, .. } => Some(format.clone()),
             _ => None,
         };
 
@@ -546,7 +546,7 @@ impl Engine {
                 audios.clone(),
                 block_size,
                 Some(matcher.clone()),
-                image_generation_format,
+                image_generation_format.clone(),
                 seq_step_type,
                 diffusion_params.clone(),
                 seq_preallocated_cache,

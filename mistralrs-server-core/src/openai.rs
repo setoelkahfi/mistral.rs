@@ -320,7 +320,7 @@ fn default_model() -> String {
 
 /// Default value helper
 fn default_response_format() -> ImageGenerationResponseFormat {
-    ImageGenerationResponseFormat::Url
+    ImageGenerationResponseFormat::Url { path: None }
 }
 
 /// Grammar specification for structured generation

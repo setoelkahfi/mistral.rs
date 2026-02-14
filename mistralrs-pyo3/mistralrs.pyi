@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterator, Literal, Mapping, Optional, Callable
+from typing import Callable, Iterator, Literal, Mapping, Optional
 
 class SearchContextSize(Enum):
     Low = "low"
@@ -160,9 +160,13 @@ class ModelDType(Enum):
     F32 = "f32"
 
 @dataclass
-class ImageGenerationResponseFormat(Enum):
-    Url = "url"
-    B64Json = "b64json"
+class ImageGenerationResponseFormat:
+    class Url:
+        path: Optional[str]
+        def __init__(self, path: Optional[str] = None) -> None: ...
+
+    class B64Json:
+        def __init__(self) -> None: ...
 
 @dataclass
 class SpeechGenerationResponse:

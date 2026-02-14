@@ -1,4 +1,4 @@
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, path::PathBuf, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use candle_core::Tensor;
@@ -25,15 +25,33 @@ pub async fn send_image_responses(
     for (seq, image) in input_seqs.iter_mut().zip(images) {
         let choice = match seq
             .image_gen_response_format()
-            .unwrap_or(ImageGenerationResponseFormat::Url)
+            .unwrap_or(ImageGenerationResponseFormat::Url { path: None })
         {
-            ImageGenerationResponseFormat::Url => {
-                let saved_path = format!("image-generation-{}.png", Uuid::new_v4());
+            ImageGenerationResponseFormat::Url { path } => {
+                let default_name = format!("image-generation-{}.png", Uuid::new_v4());
+                let saved_path = match path {
+                    Some(p) => {
+                        // If a directory path is supplied, append the generated filename
+                        if p.is_dir() || p.to_string_lossy().ends_with(std::path::MAIN_SEPARATOR) {
+                            p.join(&default_name)
+                        } else {
+                            p
+                        }
+                    }
+                    None => PathBuf::from(&default_name),
+                };
+                // Ensure parent directories exist
+                if let Some(parent) = saved_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                    }
+                }
                 image
                     .save_with_format(&saved_path, image::ImageFormat::Png)
                     .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
                 ImageChoice {
-                    url: Some(saved_path),
+                    url: Some(saved_path.display().to_string()),
                     b64_json: None,
                 }
             }

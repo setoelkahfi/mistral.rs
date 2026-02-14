@@ -389,7 +389,7 @@ impl MultimodalData {
     }
 
     pub fn image_gen_response_format(&self) -> Option<ImageGenerationResponseFormat> {
-        self.image_gen_response_format
+        self.image_gen_response_format.clone()
     }
 
     pub fn diffusion_params(&self) -> Option<DiffusionGenerationParams> {
