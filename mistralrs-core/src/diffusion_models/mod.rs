@@ -34,3 +34,13 @@ impl Default for DiffusionGenerationParams {
         }
     }
 }
+
+impl DiffusionGenerationParams {
+    /// Square image
+    pub fn square(size: usize) -> Self {
+        Self {
+            height: size,
+            width: size,
+        }
+    }
+}
