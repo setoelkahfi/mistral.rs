@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     let response = model
         .generate_image(
             "A vibrant sunset in the mountains, 4k, high quality.".to_string(),
-            ImageGenerationResponseFormat::Url,
+            ImageGenerationResponseFormat::Url { path: None },
             DiffusionGenerationParams::default(),
         )
         .await?;
