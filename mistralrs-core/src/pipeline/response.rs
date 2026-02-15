@@ -55,7 +55,7 @@ pub async fn send_image_responses(
                     b64_json: None,
                 }
             }
-            ImageGenerationResponseFormat::B64Json => {
+            ImageGenerationResponseFormat::B64Json() => {
                 let mut buffer = Vec::new();
                 image
                     .write_to(&mut Cursor::new(&mut buffer), image::ImageFormat::Png)

@@ -26,11 +26,70 @@ pub enum Constraint {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq))]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 /// Image generation response format
 pub enum ImageGenerationResponseFormat {
     Url { path: Option<PathBuf> },
-    B64Json,
+    B64Json(),
+}
+
+#[cfg(feature = "utoipa")]
+impl utoipa::PartialSchema for ImageGenerationResponseFormat {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ObjectBuilder, OneOfBuilder, SchemaType, Type};
+        use utoipa::openapi::{RefOr, Schema};
+
+        RefOr::T(Schema::OneOf(
+            OneOfBuilder::new()
+                // Url variant: { "Url": { "path": "..." } }
+                .item(Schema::Object(
+                    ObjectBuilder::new()
+                        .schema_type(SchemaType::Type(Type::Object))
+                        .property(
+                            "Url",
+                            Schema::Object(
+                                ObjectBuilder::new()
+                                    .schema_type(SchemaType::Type(Type::Object))
+                                    .property(
+                                        "path",
+                                        Schema::Object(
+                                            ObjectBuilder::new()
+                                                .schema_type(SchemaType::Type(Type::String))
+                                                .build(),
+                                        ),
+                                    )
+                                    .build(),
+                            ),
+                        )
+                        .required("Url")
+                        .build(),
+                ))
+                // B64Json variant: "B64Json"
+                .item(Schema::Object(
+                    ObjectBuilder::new()
+                        .schema_type(SchemaType::Type(Type::String))
+                        .enum_values(Some(["B64Json"]))
+                        .build(),
+                ))
+                .build(),
+        ))
+    }
+}
+
+#[cfg(feature = "utoipa")]
+impl utoipa::ToSchema for ImageGenerationResponseFormat {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ImageGenerationResponseFormat")
+    }
+
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        use utoipa::PartialSchema;
+        schemas.push((Self::name().into_owned(), Self::schema()));
+    }
 }
 
 pub type MessageContent = Either<String, Vec<IndexMap<String, Value>>>;
