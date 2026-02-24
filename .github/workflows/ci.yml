@@ -31,19 +31,46 @@ jobs:
           command: check
 
   check-metal:
-    name: Check (metal)
+    name: Check (metal - ${{ matrix.platform }})
     runs-on: macOS-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS
+            target: aarch64-apple-darwin
+            toolchain: stable
+            build-std: false
+          - platform: iOS
+            target: aarch64-apple-ios
+            toolchain: stable
+            build-std: false
+          - platform: tvOS
+            target: aarch64-apple-tvos
+            toolchain: nightly
+            build-std: true
+          - platform: visionOS
+            target: aarch64-apple-visionos
+            toolchain: nightly
+            build-std: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: ${{ matrix.toolchain }}
+          target: ${{ matrix.target }}
           override: true
-      - uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --workspace --features metal
+      - name: Add rust-src component (required for -Zbuild-std)
+        if: matrix.build-std
+        run: rustup component add rust-src --toolchain ${{ matrix.toolchain }}
+      - name: Check (metal)
+        run: |
+          if [ "${{ matrix.build-std }}" = "true" ]; then
+            cargo check --workspace --features metal --target ${{ matrix.target }} -Zbuild-std
+          else
+            cargo check --workspace --features metal --target ${{ matrix.target }}
+          fi
 
   test:
     name: Test Suite
