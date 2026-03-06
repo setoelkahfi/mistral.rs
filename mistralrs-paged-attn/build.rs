@@ -113,6 +113,55 @@ fn main() -> Result<(), String> {
     println!("cargo::rerun-if-changed=src/metal/kernels/float8.metal");
     println!("cargo::rerun-if-changed=build.rs");
 
+    // ── Track Metal toolchain version ────────────────────────────────
+    //
+    // Cargo only re-runs build scripts when files listed in
+    // rerun-if-changed are modified.  It does NOT track the Xcode /
+    // Metal compiler version.  If the user upgrades Xcode (e.g. from a
+    // beta with an air-lld bug to a fixed release), the old broken
+    // .metallib files stay cached and get silently baked into the
+    // binary via include_bytes!.
+    //
+    // We query `xcrun metal --version` and write the output to a
+    // stamp file in OUT_DIR.  If the version string changes, the stamp
+    // file changes, and Cargo will re-run the build script.
+    {
+        let out_dir =
+            PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?);
+        let stamp = out_dir.join(".metal_toolchain_version");
+
+        let current_version = Command::new("xcrun")
+            .args(["metal", "--version"])
+            .output()
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default();
+
+        let needs_rebuild = match std::fs::read_to_string(&stamp) {
+            Ok(prev) => prev != current_version,
+            Err(_) => true,
+        };
+
+        if needs_rebuild {
+            let _ = std::fs::write(&stamp, &current_version);
+            for name in [
+                "mistralrs_paged_attention.metallib",
+                "mistralrs_paged_attention_ios.metallib",
+                "mistralrs_paged_attention_tvos.metallib",
+            ] {
+                let _ = std::fs::remove_file(out_dir.join(name));
+            }
+            println!(
+                "cargo:warning=Metal toolchain version changed — recompiling Metal kernels"
+            );
+        }
+    }
+
     // Check if precompilation should be skipped
     // https://github.com/EricLBuehler/mistral.rs/pull/1311#issuecomment-3001309885
     println!("cargo:rerun-if-env-changed=MISTRALRS_METAL_PRECOMPILE");
@@ -183,32 +232,44 @@ fn main() -> Result<(), String> {
         }
         compile_air_cmd.arg(sources.join("utils.metal"));
         compile_air_cmd.arg(sources.join("float8.metal"));
-        compile_air_cmd
-            .spawn()
-            .expect("Failed to compile air")
-            .wait()
-            .expect("Failed to compile air");
 
-        let mut child = compile_air_cmd.spawn().expect("Failed to compile air");
+        let output = compile_air_cmd
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .output()
+            .expect("Failed to compile metal -> air");
 
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    panic!("Compiling metal -> air failed. Exit with status: {status}")
-                }
-            }
-            Ok(None) => {
-                let status = child
-                    .wait()
-                    .expect("Compiling metal -> air failed while waiting for result");
-                if !status.success() {
-                    panic!("Compiling metal -> air failed. Exit with status: {status}")
-                }
-            }
-            Err(e) => panic!("Compiling metal -> air failed: {e:?}"),
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "Compiling metal -> air failed for {} SDK.\n\
+                 Exit status: {}\nstderr:\n{}",
+                platform.sdk(),
+                output.status,
+                stderr,
+            );
         }
 
-        // Compile air to metallib
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        if !stderr_str.is_empty() {
+            for line in stderr_str.lines() {
+                println!("cargo:warning=[metal->air {}] {}", platform.sdk(), line);
+            }
+        }
+
+        // ── Compile air to metallib ──────────────────────────────────
+        //
+        // CRITICAL: Pass `--sdk` and `-std` here too!
+        //
+        // Without `-std=<metal_version>`, `xcrun metal` (the linker)
+        // falls back to the Metal version implied by
+        // MACOSX_DEPLOYMENT_TARGET.  When Cargo cross-compiles for
+        // x86_64-apple-darwin it sets MACOSX_DEPLOYMENT_TARGET=10.12
+        // (or 10.13), which implies Metal 2.0 / AIR 2.0.  The .air
+        // files were compiled with -std=metal3.0 (AIR 2.5), so
+        // air-lld silently rejects every .air input and produces a
+        // ~92-byte empty metallib (exit code 0).  At runtime, every
+        // Metal function cannot be found.
         let lib_name = match platform {
             Platform::MacOS => "mistralrs_paged_attention.metallib",
             Platform::Ios => "mistralrs_paged_attention_ios.metallib",
@@ -216,7 +277,13 @@ fn main() -> Result<(), String> {
         };
         let metallib = out_dir.join(lib_name);
         let mut compile_metallib_cmd = Command::new("xcrun");
-        compile_metallib_cmd.arg("metal").arg("-o").arg(&metallib);
+        compile_metallib_cmd
+            .arg("--sdk")
+            .arg(platform.sdk())
+            .arg("metal")
+            .arg(format!("-std={}", platform.metal_std()))
+            .arg("-o")
+            .arg(&metallib);
 
         for metal_file in METAL_SOURCES {
             compile_metallib_cmd.arg(out_dir.join(format!("{metal_file}.air")));
@@ -224,25 +291,78 @@ fn main() -> Result<(), String> {
         compile_metallib_cmd.arg(out_dir.join("utils.air"));
         compile_metallib_cmd.arg(out_dir.join("float8.air"));
 
-        let mut child = compile_metallib_cmd
-            .spawn()
+        let output = compile_metallib_cmd
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .output()
             .expect("Failed to compile air -> metallib");
 
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    panic!("Compiling air -> metallib failed. Exit with status: {status}")
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "Compiling air -> metallib failed for {} SDK.\n\
+                 Exit status: {}\nstderr:\n{}",
+                platform.sdk(),
+                output.status,
+                stderr,
+            );
+        }
+
+        // Detect air-lld version-mismatch warnings.
+        // Xcode 26 betas had a bug where air-lld would warn:
+        //   "ignoring file '...air', file AIR version (2.6) is bigger
+        //    than the one of the target being linked (2.0)"
+        // and silently produce a ~92-byte empty metallib (exit code 0).
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        if stderr_str.contains("air-lld: warning: ignoring file") {
+            panic!(
+                "air-lld discarded .air files due to AIR version mismatch \
+                 while linking {lib_name} ({} SDK).\n\
+                 This typically means the metallib link step is using a \
+                 lower Metal standard than the compile step, often caused \
+                 by MACOSX_DEPLOYMENT_TARGET being set to an old value.\n\
+                 Try:\n\
+                 1. Clean the build cache: rm -rf target/*/build/mistralrs-paged-attn-*\n\
+                 2. Set MISTRALRS_METAL_PRECOMPILE=0 to skip precompilation \
+                    (Metal shaders will be compiled at runtime).\n\n\
+                 air-lld stderr:\n{stderr_str}",
+                platform.sdk(),
+            );
+        }
+
+        if !stderr_str.is_empty() {
+            for line in stderr_str.lines() {
+                println!(
+                    "cargo:warning=[air->metallib {}] {}",
+                    platform.sdk(),
+                    line
+                );
+            }
+        }
+
+        // Validate metallib is not empty.
+        // A valid metallib with 5+ kernel sources should be well over 4 KB.
+        // An empty metallib header is ~92 bytes.
+        const MIN_METALLIB_SIZE: u64 = 4096;
+        match std::fs::metadata(&metallib) {
+            Ok(meta) => {
+                if meta.len() < MIN_METALLIB_SIZE {
+                    panic!(
+                        "Generated {lib_name} is only {} bytes (expected >= {MIN_METALLIB_SIZE}).\n\
+                         The metallib is likely empty — all .air inputs may have been \
+                         silently discarded by air-lld due to AIR version mismatch.\n\
+                         This happens when MACOSX_DEPLOYMENT_TARGET is set to an old \
+                         value (e.g. 10.13) which implies Metal 2.0 / AIR 2.0, but \
+                         the .air files were compiled with a newer -std.\n\
+                         Try: rm -rf target/*/build/mistralrs-paged-attn-* && cargo build\n\
+                         Or update your Xcode installation.",
+                        meta.len(),
+                    );
                 }
             }
-            Ok(None) => {
-                let status = child
-                    .wait()
-                    .expect("Compiling air -> metallib failed while waiting for result");
-                if !status.success() {
-                    panic!("Compiling air -> metallib failed. Exit with status: {status}")
-                }
+            Err(e) => {
+                panic!("Cannot stat generated {lib_name}: {e}");
             }
-            Err(e) => panic!("Compiling air -> metallib failed: {e:?}"),
         }
 
         Ok(())
