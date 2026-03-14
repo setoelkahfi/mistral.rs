@@ -181,7 +181,7 @@ impl FluxStepper {
         silent: bool,
         offloaded: bool,
     ) -> anyhow::Result<Self> {
-        let api = Api::new()?;
+        let api = Api::from_env()?;
 
         info!("Loading T5 XXL tokenizer.");
         let t5_tokenizer = get_t5_tokenizer(&api)?;
