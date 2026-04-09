@@ -1,11 +1,11 @@
-on: 
+on:
   schedule:
-      - cron: '0 0 * * 1'
+    - cron: "0 0 * * 1"
   push:
-    branches: 
+    branches:
       - master
   pull_request:
-    branches: 
+    branches:
       - master
   workflow_dispatch:
 
@@ -44,6 +44,18 @@ jobs:
         with:
           command: check
           args: --workspace --features metal
+
+  check-metal-watchos:
+    name: Check (metal, aarch64-apple-watchos)
+    runs-on: macOS-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-apple-watchos
+      - name: cargo check (watchos, metal)
+        run: cargo +nightly check -p mistralrs-paged-attn --features metal --target aarch64-apple-watchos
 
   test:
     name: Test Suite

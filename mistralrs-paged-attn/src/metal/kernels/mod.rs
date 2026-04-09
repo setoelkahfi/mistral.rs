@@ -36,6 +36,11 @@ const KERNELS: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/mistralrs_paged_attention_visionos.metallib"
 ));
+#[cfg(target_os = "watchos")]
+const KERNELS: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/mistralrs_paged_attention_watchos.metallib"
+));
 
 #[derive(thiserror::Error, Debug)]
 pub enum MetalKernelError {
@@ -274,8 +279,9 @@ impl Kernels {
 
         // Compile the preprocessed source with the correct Metal language version per platform.
         // This must match the -std=metal* flags used in build.rs for precompiled metallibs:
-        //   - macOS / iOS / tvOS → Metal 3.1 (native bfloat16 via __HAVE_BFLOAT__)
-        //   - visionOS           → Metal 4.0 (minimum supported version on visionOS)
+        //   - macOS / iOS / tvOS / watchOS → Metal 3.1 (native bfloat16 via __HAVE_BFLOAT__)
+        //   - visionOS                     → Metal 4.0 (minimum supported version on visionOS)
+        // watchOS 9+ on Apple Watch Series 4+ (S4/S7/S8/S9, A-series derived) supports Metal 3.1.
         // See: https://support.apple.com/en-us/102894
         let compile_options = {
             let opts = MTLCompileOptions::new();
