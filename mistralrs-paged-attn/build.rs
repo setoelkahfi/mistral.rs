@@ -134,6 +134,11 @@ fn main() -> Result<(), String> {
             [],
         )
         .unwrap();
+        std::fs::write(
+            out_dir.join("mistralrs_paged_attention_watchos.metallib"),
+            [],
+        )
+        .unwrap();
         return Ok(());
     }
 
@@ -142,6 +147,7 @@ fn main() -> Result<(), String> {
         Ios,
         TvOS,
         VisionOS,
+        WatchOS,
     }
 
     impl Platform {
@@ -151,20 +157,22 @@ fn main() -> Result<(), String> {
                 Platform::Ios => "iphoneos",
                 Platform::TvOS => "appletvos",
                 Platform::VisionOS => "xros",
+                Platform::WatchOS => "watchos",
             }
         }
 
         fn metal_std(&self) -> &str {
-            // Use Metal 3.0 unified standard for macOS/iOS/tvOS.
+            // Use Metal 3.1 unified standard for macOS/iOS/tvOS/watchOS.
             // This fixes Xcode 26+ where the default Metal standard may be too low.
             // https://github.com/EricLBuehler/mistral.rs/issues/1844
             //
             // Note: tvOS devices with A15+ (Apple TV 4K 3rd gen) support Metal 3.0+.
+            // watchOS 9+ on Apple Watch Series 4+ (S4/S7/S8/S9, A-series derived) supports Metal 3.1.
             //
             // visionOS only supports Metal starting with Metal 4 on visionOS 26+.
             // See: https://support.apple.com/en-us/102894
             match self {
-                Platform::MacOS | Platform::Ios | Platform::TvOS => "metal3.1",
+                Platform::MacOS | Platform::Ios | Platform::TvOS | Platform::WatchOS => "metal3.1",
                 Platform::VisionOS => "metal4.0",
             }
         }
@@ -225,6 +233,7 @@ fn main() -> Result<(), String> {
             Platform::Ios => "mistralrs_paged_attention_ios.metallib",
             Platform::TvOS => "mistralrs_paged_attention_tvos.metallib",
             Platform::VisionOS => "mistralrs_paged_attention_visionos.metallib",
+            Platform::WatchOS => "mistralrs_paged_attention_watchos.metallib",
         };
         let metallib = out_dir.join(lib_name);
         let mut compile_metallib_cmd = Command::new("xcrun");
@@ -264,6 +273,7 @@ fn main() -> Result<(), String> {
     compile(Platform::Ios)?;
     compile(Platform::TvOS)?;
     compile(Platform::VisionOS)?;
+    compile(Platform::WatchOS)?;
 
     Ok(())
 }
