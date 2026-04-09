@@ -243,6 +243,7 @@ fn main() -> Result<(), String> {
             std::fs::write(out_dir.join("mistralrs_quant_ios.metallib"), []).unwrap();
             std::fs::write(out_dir.join("mistralrs_quant_tvos.metallib"), []).unwrap();
             std::fs::write(out_dir.join("mistralrs_quant_visionos.metallib"), []).unwrap();
+            std::fs::write(out_dir.join("mistralrs_quant_watchos.metallib"), []).unwrap();
             return Ok(());
         }
 
@@ -251,6 +252,7 @@ fn main() -> Result<(), String> {
             Ios,
             TvOS,
             VisionOS,
+            WatchOS,
         }
 
         impl Platform {
@@ -260,6 +262,7 @@ fn main() -> Result<(), String> {
                     Platform::Ios => "iphoneos",
                     Platform::TvOS => "appletvos",
                     Platform::VisionOS => "xros",
+                    Platform::WatchOS => "watchos",
                 }
             }
 
@@ -282,7 +285,7 @@ fn main() -> Result<(), String> {
                 //        https://support.apple.com/en-us/102894
                 match self {
                     Platform::MacOS => "metal3.1",
-                    Platform::Ios | Platform::TvOS => "metal3.0",
+                    Platform::Ios | Platform::TvOS | Platform::WatchOS => "metal3.0",
                     Platform::VisionOS => "metal4.0",
                 }
             }
@@ -359,6 +362,7 @@ fn main() -> Result<(), String> {
                 Platform::Ios => "mistralrs_quant_ios.metallib",
                 Platform::TvOS => "mistralrs_quant_tvos.metallib",
                 Platform::VisionOS => "mistralrs_quant_visionos.metallib",
+                Platform::WatchOS => "mistralrs_quant_watchos.metallib",
             };
             let metallib = out_dir.join(lib_name);
             let mut compile_metallib_cmd = Command::new("xcrun");
@@ -460,6 +464,7 @@ fn main() -> Result<(), String> {
         compile(Platform::Ios)?;
         compile(Platform::TvOS)?;
         compile(Platform::VisionOS)?;
+        compile(Platform::WatchOS)?;
 
         Ok(())
     }
