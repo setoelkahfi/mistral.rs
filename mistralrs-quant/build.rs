@@ -187,8 +187,7 @@ fn main() -> Result<(), String> {
         // stamp file in OUT_DIR.  If the version string changes, the stamp
         // file changes, and Cargo will re-run the build script.
         {
-            let out_dir =
-                PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?);
+            let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?);
             let stamp = out_dir.join(".metal_toolchain_version");
 
             let current_version = Command::new("xcrun")
@@ -243,6 +242,7 @@ fn main() -> Result<(), String> {
             std::fs::write(out_dir.join("mistralrs_quant.metallib"), []).unwrap();
             std::fs::write(out_dir.join("mistralrs_quant_ios.metallib"), []).unwrap();
             std::fs::write(out_dir.join("mistralrs_quant_tvos.metallib"), []).unwrap();
+            std::fs::write(out_dir.join("mistralrs_quant_visionos.metallib"), []).unwrap();
             return Ok(());
         }
 
@@ -250,6 +250,7 @@ fn main() -> Result<(), String> {
             MacOS,
             Ios,
             TvOS,
+            VisionOS,
         }
 
         impl Platform {
@@ -258,6 +259,7 @@ fn main() -> Result<(), String> {
                     Platform::MacOS => "macosx",
                     Platform::Ios => "iphoneos",
                     Platform::TvOS => "appletvos",
+                    Platform::VisionOS => "xros",
                 }
             }
 
@@ -276,9 +278,12 @@ fn main() -> Result<(), String> {
                 //        already guard bfloat instantiation behind
                 //        `#if __METAL_VERSION__ >= 310`.
                 // tvOS:  Metal 3.0 — Apple TV 4K (3rd gen) uses A15 = Metal 3.0.
+                // visionOS: Metal 4.0 — visionOS 26+ requires Metal 4.0.
+                //        https://support.apple.com/en-us/102894
                 match self {
                     Platform::MacOS => "metal3.1",
                     Platform::Ios | Platform::TvOS => "metal3.0",
+                    Platform::VisionOS => "metal4.0",
                 }
             }
         }
@@ -353,6 +358,7 @@ fn main() -> Result<(), String> {
                 Platform::MacOS => "mistralrs_quant.metallib",
                 Platform::Ios => "mistralrs_quant_ios.metallib",
                 Platform::TvOS => "mistralrs_quant_tvos.metallib",
+                Platform::VisionOS => "mistralrs_quant_visionos.metallib",
             };
             let metallib = out_dir.join(lib_name);
             let mut compile_metallib_cmd = Command::new("xcrun");
@@ -414,11 +420,7 @@ fn main() -> Result<(), String> {
 
             if !stderr_str.is_empty() {
                 for line in stderr_str.lines() {
-                    println!(
-                        "cargo:warning=[air->metallib {}] {}",
-                        platform.sdk(),
-                        line
-                    );
+                    println!("cargo:warning=[air->metallib {}] {}", platform.sdk(), line);
                 }
             }
 
@@ -457,6 +459,7 @@ fn main() -> Result<(), String> {
         compile(Platform::MacOS)?;
         compile(Platform::Ios)?;
         compile(Platform::TvOS)?;
+        compile(Platform::VisionOS)?;
 
         Ok(())
     }
