@@ -195,8 +195,12 @@ mistralrs-macros = { path = "mistralrs-macros", version = "0.8.1" }
 # Use forked sysctl with watchOS (target_os = "watchos") support until upstream merges it.
 # Upstream PR: https://github.com/johalun/sysctl-rs/pull/XXX
 # Fork branch: https://github.com/setoelkahfi/sysctl-rs/tree/feature/watchos
+#
+# Workaround: core2 0.4.0 was yanked from crates.io but is still pulled in by
+# openai-harmony → image (default features) → ravif → rav1e → bitstream-io.
 [patch.crates-io]
 sysctl = { git = "https://github.com/setoelkahfi/sysctl-rs.git", branch = "feature/watchos" }
+core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bc" }
 
 [profile.release-with-debug]
 inherits = "release"
@@ -211,8 +215,3 @@ debug = true
 [profile.dev]
 debug = true
 opt-level = 3
-
-# Workaround: core2 0.4.0 was yanked from crates.io but is still pulled in by
-# openai-harmony → image (default features) → ravif → rav1e → bitstream-io.
-[patch.crates-io]
-core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bc" }
