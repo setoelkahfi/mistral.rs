@@ -7,7 +7,7 @@ use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::Embedding;
 use mistralrs_quant::{
     ColumnParallelLayer, GgufMatMul, QuantMethod, QuantMethodConfig, ReplicatedLayer,
-    RowParallelLayer, ShardedVarBuilder,
+    RowParallelLayer, ShardedVarBuilder, UnquantLinear,
 };
 
 use crate::{
@@ -15,8 +15,7 @@ use crate::{
     attention::{AttentionMask, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
-        embedding, Activation, CausalMasker, MatMul, Mlp, RmsNorm, RotaryEmbedding,
-        ScaledEmbedding, Sdpa,
+        embedding, Activation, CausalMasker, Mlp, RmsNorm, RotaryEmbedding, ScaledEmbedding, Sdpa,
     },
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
@@ -150,6 +149,30 @@ impl ProportionalRotaryEmbedding {
                 k_embeds.push(k_embed);
             }
             Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
+        }
+    }
+
+    /// Apply RoPE to Q only (skip K rotation for shared KV layers).
+    fn forward_q(&self, q: &Tensor, seqlen_offsets: &[usize]) -> Result<Tensor> {
+        let (_b_sz, _qh, seq_len, _n_embd) = q.dims4()?;
+        let rope = if self.is_gpt_neox {
+            candle_nn::rotary_emb::rope
+        } else {
+            candle_nn::rotary_emb::rope_i
+        };
+        if seqlen_offsets.len() == 1 {
+            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
+            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?;
+            rope(&q.contiguous()?, &cos, &sin)
+        } else {
+            let mut q_embeds = Vec::new();
+            for (seq_idx, offset) in seqlen_offsets.iter().enumerate() {
+                let cos = self.cos.narrow(0, *offset, seq_len)?;
+                let sin = self.sin.narrow(0, *offset, seq_len)?;
+                let q_s = q.i(seq_idx)?;
+                q_embeds.push(rope(&q_s.unsqueeze(0)?.contiguous()?, &cos, &sin)?);
+            }
+            Tensor::cat(&q_embeds, 0)
         }
     }
 }
@@ -386,60 +409,64 @@ impl Attention {
         flash_params: Option<&FlashParams>,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
+        let is_shared = self.kv_shared_layer_index.is_some();
 
-        let original_dtype = xs.dtype();
-        let mut xs_proj = xs.clone();
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            xs_proj = xs_proj.to_dtype(t)?;
-        }
-        let mut q = MatMul.qmethod_matmul(&xs_proj, &*self.q_proj)?;
-        let mut k = MatMul.qmethod_matmul(&xs_proj, &*self.k_proj)?;
-        let mut v = if let Some(ref v_proj) = self.v_proj {
-            MatMul.qmethod_matmul(&xs_proj, &**v_proj)?
+        // Q projection (always needed)
+        let mut q = self.q_proj.forward(xs)?;
+        q = if q_len != 1 {
+            q.reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+                .transpose(1, 2)?
         } else {
-            // K=V: clone k before norms/RoPE
-            k.clone()
+            q.reshape((b_sz, self.num_heads, q_len, self.head_dim))?
         };
-        if self.q_proj.quantized_act_type().is_some() {
-            q = q.to_dtype(original_dtype)?;
-            k = k.to_dtype(original_dtype)?;
-            v = v.to_dtype(original_dtype)?;
-        }
-
-        (q, k, v) = if q_len != 1 {
-            let q = q
-                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = k
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = v
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v)
-        } else {
-            let q = q.reshape((b_sz, self.num_heads, q_len, self.head_dim))?;
-            let k = k.reshape((b_sz, self.num_kv_heads, q_len, self.head_dim))?;
-            let v = v.reshape((b_sz, self.num_kv_heads, q_len, self.head_dim))?;
-            (q, k, v)
-        };
-
-        // Apply Q/K/V norms
         q = q.apply(&self.q_norm)?;
-        k = k.apply(&self.k_norm)?;
-        v = v.apply(&self.v_norm_rms)?;
+
+        // K/V projection, reshape, norms (skip for shared layers that reuse donor KV)
+        let (mut k, v) = if !is_shared {
+            let k = self.k_proj.forward(xs)?;
+            let v = if let Some(ref v_proj) = self.v_proj {
+                v_proj.forward(xs)?
+            } else {
+                k.clone()
+            };
+            let (k, v) = if q_len != 1 {
+                (
+                    k.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+                        .transpose(1, 2)?,
+                    v.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+                        .transpose(1, 2)?,
+                )
+            } else {
+                (
+                    k.reshape((b_sz, self.num_kv_heads, q_len, self.head_dim))?,
+                    v.reshape((b_sz, self.num_kv_heads, q_len, self.head_dim))?,
+                )
+            };
+            (
+                Some(k.apply(&self.k_norm)?),
+                Some(v.apply(&self.v_norm_rms)?),
+            )
+        } else {
+            (None, None)
+        };
 
         // Apply RoPE
         if self.is_sliding {
-            let (q_rot, k_rot) = self.rotary_emb_local.forward(&q, &k, seqlen_offsets)?;
-            q = q_rot;
-            k = k_rot;
+            if let Some(k_val) = k.take() {
+                let (q_rot, k_rot) = self.rotary_emb_local.forward(&q, &k_val, seqlen_offsets)?;
+                q = q_rot;
+                k = Some(k_rot);
+            } else {
+                q = self.rotary_emb_local.forward_q(&q, seqlen_offsets)?;
+            }
         } else {
-            // ProportionalRotaryEmbedding handles the full head_dim with zero-padded
-            // inv_freq, cos=1, sin=0 for non-rotated positions, so identity.
-            let (q_rot, k_rot) = self.rotary_emb_global.forward(&q, &k, seqlen_offsets)?;
-            q = q_rot;
-            k = k_rot;
+            if let Some(k_val) = k.take() {
+                let (q_rot, k_rot) = self.rotary_emb_global.forward(&q, &k_val, seqlen_offsets)?;
+                q = q_rot;
+                k = Some(k_rot);
+            } else {
+                q = self.rotary_emb_global.forward_q(&q, seqlen_offsets)?;
+            }
         }
 
         let mut attn_output = match &self.paged_attn {
@@ -456,8 +483,6 @@ impl Attention {
                     attention_mask
                 };
                 let paged_mask = mask;
-
-                let is_shared = self.kv_shared_layer_index.is_some();
 
                 match metadata {
                     Some(((key_cache, value_cache), input_metadata)) => {
@@ -477,8 +502,8 @@ impl Attention {
                             // Non-shared: standard paged attention with raw k,v.
                             paged_attn.forward(
                                 &q,
-                                &k,
-                                &v,
+                                k.as_ref().unwrap(),
+                                v.as_ref().unwrap(),
                                 paged_mask,
                                 Some(key_cache),
                                 Some(value_cache),
@@ -493,8 +518,8 @@ impl Attention {
                         assert!(!matches!(paged_mask, AttentionMask::None));
                         paged_attn.forward(
                             &q,
-                            &k,
-                            &v,
+                            k.as_ref().unwrap(),
+                            v.as_ref().unwrap(),
                             paged_mask,
                             None,
                             None,
@@ -509,11 +534,31 @@ impl Attention {
                 // Eager attention path, use normal kv_caches.
                 let (k, v) = if let Some(donor_idx) = self.kv_shared_layer_index {
                     let donor_cache = &kv_caches[donor_idx];
-                    let dk = donor_cache.k()?.unwrap().to_device(q.device())?;
-                    let dv = donor_cache.v()?.unwrap().to_device(q.device())?;
-                    (dk, dv)
+                    // Use appended_k/v to get the full K/V from the donor's last
+                    // append (retained + new during prefill), not the truncated
+                    // sliding-window buffer that current_data()/k()/v() returns.
+                    let dk = donor_cache.appended_k()?.unwrap().to_device(q.device())?;
+                    let dv = donor_cache.appended_v()?.unwrap().to_device(q.device())?;
+                    // Shared sliding-window layers read from a full (non-rotating) donor cache.
+                    // During decode (q_len == 1) there is no explicit mask, so narrow the KV to the sliding window.
+                    // During prefill the mask handles this.
+                    if self.is_sliding && q_len == 1 {
+                        if let Some(window) = self.sdpa_params.sliding_window {
+                            let kv_len = dk.dim(2)?;
+                            if kv_len > window {
+                                let start = kv_len - window;
+                                (dk.narrow(2, start, window)?, dv.narrow(2, start, window)?)
+                            } else {
+                                (dk, dv)
+                            }
+                        } else {
+                            (dk, dv)
+                        }
+                    } else {
+                        (dk, dv)
+                    }
                 } else {
-                    kv_caches[self.layer_idx].append(&k, &v)?
+                    kv_caches[self.layer_idx].append(k.as_ref().unwrap(), v.as_ref().unwrap())?
                 };
 
                 let mask = if self.is_sliding {
@@ -558,13 +603,24 @@ impl Attention {
                     None => AttentionMask::None,
                 };
 
-                Sdpa.run_attention(&q, &k, &v, &mask, flash_params, &self.sdpa_params)?
+                // Gemma 4 attention scores reach magnitude 15-20 with
+                // softmax_scale=1. At that range BF16 precision is ~0.15,
+                // so the Metal SDPA vector kernel (F32 internally) resolves
+                // score differences that a BF16 matmul rounds away,
+                // producing different softmax winners. Promote to F32
+                // during decode so both code paths agree.
+                if q_len == 1 && q.dtype() != candle_core::DType::F32 {
+                    let q32 = q.to_dtype(candle_core::DType::F32)?;
+                    let k32 = k.to_dtype(candle_core::DType::F32)?;
+                    let v32 = v.to_dtype(candle_core::DType::F32)?;
+                    Sdpa.run_attention(&q32, &k32, &v32, &mask, flash_params, &self.sdpa_params)?
+                        .to_dtype(q.dtype())?
+                } else {
+                    Sdpa.run_attention(&q, &k, &v, &mask, flash_params, &self.sdpa_params)?
+                }
             }
         };
 
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            attn_output = attn_output.to_dtype(t)?;
-        }
         let has_mask = !matches!(attention_mask, AttentionMask::None)
             || !matches!(sliding_attention_mask, AttentionMask::None);
         attn_output = if has_mask {
@@ -572,10 +628,7 @@ impl Attention {
         } else {
             attn_output.reshape((b_sz, q_len, ()))?
         };
-        let mut res = MatMul.qmethod_matmul(&attn_output, &*self.o_proj)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.o_proj.forward(&attn_output)?;
         Ok(res)
     }
 }
@@ -898,27 +951,14 @@ impl DecoderLayer {
         ) {
             if let Some(pli) = per_layer_input {
                 let residual_ple = xs.clone();
-                let original_dtype = xs.dtype();
                 // gate: Linear(hidden_size -> ple_dim)
-                let mut gate_in = xs;
-                if let Some(t) = gate.quantized_act_type() {
-                    gate_in = gate_in.to_dtype(t)?;
-                }
-                let mut gated = MatMul.qmethod_matmul(&gate_in, &**gate)?;
-                if gate.quantized_act_type().is_some() {
-                    gated = gated.to_dtype(original_dtype)?;
-                }
+                let gate_in = xs;
+                let mut gated = gate.forward(&gate_in)?;
                 // activation + elementwise multiply with per_layer_input
                 gated = gated.apply(&self.act)?;
                 gated = (gated * pli)?;
                 // projection: Linear(ple_dim -> hidden_size)
-                if let Some(t) = proj.quantized_act_type() {
-                    gated = gated.to_dtype(t)?;
-                }
-                let mut projected = MatMul.qmethod_matmul(&gated, &**proj)?;
-                if proj.quantized_act_type().is_some() {
-                    projected = projected.to_dtype(original_dtype)?;
-                }
+                let projected = proj.forward(&gated)?;
                 // post-norm + residual
                 let normed = norm.forward(&projected)?;
                 xs = (residual_ple + normed)?;
@@ -1178,7 +1218,7 @@ impl TextModel {
             mapper.set_nm_device(vb_m.pp("norm"), false),
         )?;
 
-        let lm_head = if !cfg.tie_word_embeddings {
+        let lm_head: Arc<dyn QuantMethod> = if !cfg.tie_word_embeddings {
             ReplicatedLayer::new(
                 cfg.hidden_size,
                 cfg.vocab_size,
@@ -1187,21 +1227,24 @@ impl TextModel {
                 mapper.set_nm_device(vb_m.pp("lm_head"), normal_loading_metadata.loading_isq),
             )?
         } else {
-            // Quantize the tied lm_head to Q8_0 for faster decode.
-            // The embedding stays in BF16 for token lookup; lm_head gets a separate
-            // quantized copy. Q8_0 has sufficient precision for logit computation.
-            let weight = mapper.cast_nm_device(embed_tokens.embeddings(), false)?;
-            let target_device = weight.device().clone();
-            let weight_cpu = weight.to_device(&candle_core::Device::Cpu)?;
-            let qt = std::sync::Arc::new(candle_core::quantized::QTensor::quantize_onto(
-                &weight_cpu,
-                candle_core::quantized::GgmlDType::Q8_0,
-                &target_device,
-            )?);
-            Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                q_weight: qt,
-                b: None,
-            })?)
+            // Keep the tied lm head quantized on CUDA so it can use the
+            // GGUF matmul fast path without changing token embeddings.
+            let embed_weight = mapper.cast_nm_device(embed_tokens.embeddings(), false)?;
+            if embed_weight.device().is_cuda() {
+                let w_f32 = embed_weight.to_dtype(DType::F32)?;
+                let q_weight = candle_core::quantized::QTensor::quantize(
+                    &w_f32,
+                    candle_core::quantized::GgmlDType::Q8_0,
+                )?;
+                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                    q_weight: Arc::new(q_weight),
+                    b: None,
+                })?) as Arc<dyn QuantMethod>
+            } else {
+                Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(
+                    candle_nn::Linear::new(embed_weight, None),
+                ))?) as Arc<dyn QuantMethod>
+            }
         };
 
         // PLE global components
@@ -1396,15 +1439,7 @@ impl TextModel {
         let embedded = embedded.reshape((b, seq, self.num_hidden_layers, ple_dim))?;
 
         // 2. Project input embeddings: Linear(hidden_size -> num_layers * ple_dim)
-        let original_dtype = inputs_embeds.dtype();
-        let mut proj_input = inputs_embeds.clone();
-        if let Some(t) = ple_proj.quantized_act_type() {
-            proj_input = proj_input.to_dtype(t)?;
-        }
-        let mut projected = MatMul.qmethod_matmul(&proj_input, &**ple_proj)?;
-        if ple_proj.quantized_act_type().is_some() {
-            projected = projected.to_dtype(original_dtype)?;
-        }
+        let projected = ple_proj.forward(inputs_embeds)?;
         // Apply scalar: hidden_size^-0.5
         let projected = (projected * self.per_layer_projection_scalar)?;
         // Reshape to [b, seq, num_layers, ple_dim]
@@ -1585,12 +1620,8 @@ impl TextModel {
         }
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
-        let mut xs = extract_logits(&xs, context_lens)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-
-        let mut xs = MatMul.qmethod_matmul(&xs, &*self.lm_head)?;
+        let xs = extract_logits(&xs, context_lens)?;
+        let mut xs = self.lm_head.forward(&xs)?;
 
         if let Some(final_logit_softcapping) = self.final_logit_softcapping {
             let original_dtype = xs.dtype();
