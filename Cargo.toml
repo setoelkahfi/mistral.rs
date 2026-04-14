@@ -211,3 +211,8 @@ debug = true
 [profile.dev]
 debug = true
 opt-level = 3
+
+# Workaround: core2 0.4.0 was yanked from crates.io but is still pulled in by
+# openai-harmony → image (default features) → ravif → rav1e → bitstream-io.
+[patch.crates-io]
+core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bc" }
