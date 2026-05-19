@@ -53,8 +53,10 @@ use crate::{
 };
 
 mod add_request;
+pub(crate) mod agentic_loop;
+pub(crate) mod agentic_session;
+mod file_tools;
 mod logger;
-mod search_request;
 mod tool_dispatch;
 
 pub enum EngineInstruction {
@@ -172,6 +174,8 @@ pub struct Engine {
     logger: Arc<IntervalLogger>,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     pending_notify: Arc<Notify>,
+    pub(crate) session_store: Arc<std::sync::Mutex<agentic_session::AgenticSessionStore>>,
+    pub(crate) file_store: crate::files::FileStore,
 }
 
 impl Drop for Engine {
@@ -198,6 +202,8 @@ impl Engine {
         search_callback: Option<Arc<search::SearchCallback>>,
         tool_callbacks: tools::ToolCallbacksWithTools,
         logger: Arc<IntervalLogger>,
+        session_store: Arc<std::sync::Mutex<agentic_session::AgenticSessionStore>>,
+        file_store: crate::files::FileStore,
     ) -> anyhow::Result<Self> {
         no_kv_cache |= get_mut_arcmutex!(pipeline).get_metadata().no_kv_cache;
 
@@ -243,6 +249,8 @@ impl Engine {
             logger,
             handles: Arc::new(Mutex::new(Vec::new())),
             pending_notify: Arc::new(Notify::new()),
+            session_store,
+            file_store,
         })
     }
 
