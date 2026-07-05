@@ -54,8 +54,40 @@ export interface AgenticToolCallProgress {
   data: AgenticToolCallData;
 }
 
+export interface AgentToolMetadata {
+  source: "built_in" | "user" | "mcp" | "external";
+  kind: "code_execution" | "web_search" | "shell" | "file" | "custom" | "external";
+  label: string;
+}
+
+export interface AgentToolApprovalRequired {
+  type: "agentic_tool_approval_required";
+  approval_id: string;
+  session_id: string;
+  round: number;
+  tool: AgentToolMetadata;
+  arguments: Record<string, unknown>;
+}
+
+export type AgentToolApprovalStatus =
+  | "pending"
+  | "submitting"
+  | "approved"
+  | "denied"
+  | "error";
+
+export interface AgentToolApprovalBlock extends AgentToolApprovalRequired {
+  status: AgentToolApprovalStatus;
+  remember_for_session?: boolean;
+  message?: string;
+  error?: string;
+}
+
+export type AgentPermission = "auto" | "ask" | "deny";
+
 export type AgenticToolCallData =
   | CodeExecutionData
+  | ShellData
   | WebSearchData
   | CustomToolData;
 
@@ -76,6 +108,17 @@ export interface WebSearchData {
   tool_type: "web_search";
   query?: string;
   results_count?: number;
+}
+
+export interface ShellData {
+  tool_type: "shell";
+  commands: string[];
+  stdout?: string;
+  stderr?: string;
+  exit_code?: number;
+  status?: string;
+  working_directory?: string;
+  timed_out?: boolean;
 }
 
 export interface CustomToolData {
@@ -163,6 +206,7 @@ export interface ChatMessageRecord {
 export interface Capabilities {
   search_enabled: boolean;
   code_execution_enabled: boolean;
+  shell_enabled: boolean;
   tool_dispatch_url: string | null;
 }
 
@@ -176,6 +220,7 @@ export interface Settings {
 export type StreamBlock =
   | { type: "reasoning"; content: string }
   | { type: "tool_call"; data: AgenticToolCallProgress }
+  | { type: "approval"; data: AgentToolApprovalBlock }
   | { type: "content"; content: string }
   | { type: "file"; data: File };
 
@@ -210,6 +255,8 @@ export interface StreamOptions {
   enable_thinking?: boolean;
   web_search_options?: WebSearchOptions;
   enable_code_execution?: boolean;
+  enable_shell?: boolean;
+  agent_permission?: AgentPermission;
   /** If set, server reuses the agentic session (tool history, code execution state). */
   session_id?: string;
   /** Required output files to declare on the request. */
@@ -231,6 +278,7 @@ export interface StreamCallbacks {
   onContent: (text: string) => void;
   onReasoning: (text: string) => void;
   onToolCallProgress: (event: AgenticToolCallProgress) => void;
+  onApprovalRequired: (event: AgentToolApprovalRequired) => void;
   onFile: (file: File) => void;
   onFinishReason: (reason: string) => void;
   onSessionId: (id: string) => void;

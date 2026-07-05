@@ -49,8 +49,8 @@ mistralrs run --format gguf -m <repo> -f <file>
 # Run server
 mistralrs serve -p 1234 -m <model_id>
 
-# Run server with web UI
-mistralrs serve --ui -m <model_id>
+# Run server (built-in web UI is on by default at /ui; pass --no-ui to disable)
+mistralrs serve -m <model_id>
 
 # Run benchmarks
 mistralrs bench -m <model_id>
@@ -75,7 +75,6 @@ You should also look for a model.safetensors.index.json file for the model at ha
 - `mistralrs-paged-attn/` - PagedAttention implementation
 - `mistralrs-audio/` - Audio processing
 - `mistralrs-mcp/` - Model Context Protocol client
-- `mistralrs-bench/` - (Deprecated) Use `mistralrs bench` instead
 
 ### Key Design Patterns
 

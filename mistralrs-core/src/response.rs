@@ -282,6 +282,17 @@ pub enum AgenticToolCallData {
     WebSearch {
         query: Option<String>,
         results_count: Option<usize>,
+        sources: Vec<String>,
+    },
+    /// Shell command execution.
+    Shell {
+        commands: Vec<String>,
+        stdout: Option<String>,
+        stderr: Option<String>,
+        exit_code: Option<i64>,
+        status: Option<String>,
+        working_directory: Option<String>,
+        timed_out: Option<bool>,
     },
     /// User callback, MCP, or HTTP dispatch. Opaque to the engine.
     Custom { arguments: String, content: String },
@@ -294,6 +305,17 @@ pub enum AgenticToolCallPhase {
     Calling(AgenticToolCallData),
     /// Execution complete.
     Complete(AgenticToolCallData),
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockDenoisingProgress {
+    pub index: usize,
+    pub step: usize,
+    pub total_steps: usize,
+    pub tokens: Vec<u32>,
+    pub text: String,
+    pub finished: bool,
+    pub final_block: bool,
 }
 
 /// The response enum contains 3 types of variants:
@@ -335,6 +357,14 @@ pub enum Response {
         tool_name: String,
         phase: AgenticToolCallPhase,
     },
+    BlockDenoisingProgress(BlockDenoisingProgress),
+    AgenticToolApprovalRequired {
+        approval_id: String,
+        session_id: String,
+        round: usize,
+        tool: crate::AgentToolMetadata,
+        arguments: serde_json::Value,
+    },
     /// Emitted as soon as the runtime reads a file out of the working directory.
     File(crate::files::File),
 }
@@ -371,6 +401,14 @@ pub enum ResponseOk {
         round: usize,
         tool_name: String,
         phase: AgenticToolCallPhase,
+    },
+    BlockDenoisingProgress(BlockDenoisingProgress),
+    AgenticToolApprovalRequired {
+        approval_id: String,
+        session_id: String,
+        round: usize,
+        tool: crate::AgentToolMetadata,
+        arguments: serde_json::Value,
     },
     File(crate::files::File),
 }
@@ -468,6 +506,22 @@ impl Response {
                 round,
                 tool_name,
                 phase,
+            }),
+            Self::BlockDenoisingProgress(progress) => {
+                Ok(ResponseOk::BlockDenoisingProgress(progress))
+            }
+            Self::AgenticToolApprovalRequired {
+                approval_id,
+                session_id,
+                round,
+                tool,
+                arguments,
+            } => Ok(ResponseOk::AgenticToolApprovalRequired {
+                approval_id,
+                session_id,
+                round,
+                tool,
+                arguments,
             }),
             Self::File(f) => Ok(ResponseOk::File(f)),
         }

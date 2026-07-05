@@ -3,9 +3,11 @@
   import { renderMarkdown } from "../utils/markdown";
   import ThinkingBlock from "./ThinkingBlock.svelte";
   import CodeExecution from "./CodeExecution.svelte";
+  import ShellTool from "./ShellTool.svelte";
   import SearchResult from "./SearchResult.svelte";
   import CustomTool from "./CustomTool.svelte";
   import FileCard from "./FileCard.svelte";
+  import AgentApproval from "./AgentApproval.svelte";
   import { chatStore } from "../stores/chat.svelte";
 
   let { message, streaming = false }: { message: DisplayMessage; streaming?: boolean } = $props();
@@ -80,8 +82,8 @@
   }
 </script>
 
-<div class="flex justify-start">
-  <div class="max-w-[85%] space-y-2">
+<div class="flex w-full justify-start">
+  <div class="w-full max-w-[85%] space-y-2">
     <!-- Ordered blocks: content, reasoning, and tool calls in arrival sequence -->
     {#each renderedBlocks as block, i (i)}
       {#if block.type === "reasoning"}
@@ -89,6 +91,8 @@
       {:else if block.type === "tool_call"}
         {#if block.data.data.tool_type === "code_execution"}
           <CodeExecution data={block.data.data} phase={block.data.phase} />
+        {:else if block.data.data.tool_type === "shell"}
+          <ShellTool data={block.data.data} phase={block.data.phase} />
         {:else if block.data.data.tool_type === "web_search"}
           <SearchResult data={block.data.data} phase={block.data.phase} />
         {:else if block.data.data.tool_type === "custom"}
@@ -102,6 +106,8 @@
         </div>
       {:else if block.type === "file"}
         <FileCard file={block.data} />
+      {:else if block.type === "approval"}
+        <AgentApproval data={block.data} />
       {/if}
     {/each}
 

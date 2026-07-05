@@ -147,7 +147,10 @@ impl futures::Stream for CompletionStreamer {
 
                     Poll::Ready(Some(Event::default().json_data(response)))
                 }
-                Response::AgenticToolCallProgress { .. } | Response::File(_) => {
+                Response::AgenticToolCallProgress { .. }
+                | Response::BlockDenoisingProgress(_)
+                | Response::AgenticToolApprovalRequired { .. }
+                | Response::File(_) => {
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
@@ -209,6 +212,10 @@ pub fn parse_request(
     // Validate that the requested model matches the loaded model
     validate_model_name(&oairequest.model, state.clone())?;
 
+    if oairequest.max_tokens == Some(0) {
+        anyhow::bail!("max_tokens must be at least 1.");
+    }
+
     let stop_toks = convert_stop_tokens(oairequest.stop_seqs);
 
     let is_streaming = oairequest.stream.unwrap_or(false);
@@ -260,6 +267,13 @@ pub fn parse_request(
             return_raw_logits: false,
             web_search_options: None,
             enable_code_execution: false,
+            enable_shell: false,
+            shell_options: None,
+            code_execution_permission: None,
+            code_execution_approval_notifier: None,
+            agent_permission: None,
+            agent_approval_handler: None,
+            agent_approval_notifier: None,
             max_tool_rounds: None,
             tool_dispatch_url: None,
             model_id: if oairequest.model == "default" {
@@ -270,6 +284,7 @@ pub fn parse_request(
             truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
             session_id: None,
             files: None,
+            input_files: Vec::new(),
         })),
         is_streaming,
     ))
@@ -361,6 +376,8 @@ pub fn match_responses(state: SharedMistralRsState, response: Response) -> Compl
         Response::Raw { .. } => unreachable!(),
         Response::Embeddings { .. } => unreachable!(),
         Response::AgenticToolCallProgress { .. } => unreachable!(),
+        Response::BlockDenoisingProgress(_) => unreachable!(),
+        Response::AgenticToolApprovalRequired { .. } => unreachable!(),
         Response::File(_) => unreachable!(),
     }
 }

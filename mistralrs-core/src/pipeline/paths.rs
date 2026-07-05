@@ -6,24 +6,21 @@ use std::{
 
 use anyhow::Result;
 use either::Either;
-use hf_hub::{
-    api::sync::{ApiBuilder, ApiRepo},
-    Repo, RepoType,
-};
+use hf_hub::{api::sync::ApiRepo, Repo, RepoType};
 use regex_automata::meta::Regex;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     api_dir_list, api_get_file,
     lora::LoraConfig,
     pipeline::{
         chat_template::{BeginEndUnkPadTok, ChatTemplate, ChatTemplateValue},
+        hf::build_api,
         isq::UQFF_RESIDUAL_SAFETENSORS,
     },
-    utils::tokens::get_token,
     xlora_models::XLoraConfig,
-    ModelPaths, Ordering, TokenSource, GLOBAL_HF_CACHE,
+    ModelPaths, Ordering, TokenSource,
 };
 
 // Match files against these
@@ -63,16 +60,7 @@ pub fn get_xlora_paths(
 ) -> Result<AdapterPaths> {
     match (lora_adapter_ids, xlora_model_id, xlora_order) {
         (None, Some(xlora_id), Some(xlora_order)) => {
-            let api = {
-                let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
-                let mut api = ApiBuilder::from_cache(cache)
-                    .with_progress(true)
-                    .with_token(get_token(token_source)?);
-                if let Some(cache_dir) = crate::hf_hub_cache_dir() {
-                    api = api.with_cache_dir(cache_dir);
-                }
-                api.build().map_err(candle_core::Error::msg)?
-            };
+            let api = build_api(token_source, true).map_err(candle_core::Error::msg)?;
             let api = api.repo(Repo::with_revision(
                 xlora_id.clone(),
                 RepoType::Model,
@@ -277,16 +265,7 @@ pub fn get_xlora_paths(
             for adapter_id in adapter_ids {
                 info!("Loading adapter at `{adapter_id}`");
 
-                let api = {
-                    let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
-                    let mut api = ApiBuilder::from_cache(cache)
-                        .with_progress(true)
-                        .with_token(get_token(token_source)?);
-                    if let Some(cache_dir) = crate::hf_hub_cache_dir() {
-                        api = api.with_cache_dir(cache_dir);
-                    }
-                    api.build().map_err(candle_core::Error::msg)?
-                };
+                let api = build_api(token_source, true).map_err(candle_core::Error::msg)?;
                 let api = api.repo(Repo::with_revision(
                     adapter_id.clone(),
                     RepoType::Model,
@@ -339,16 +318,7 @@ pub fn get_model_paths(
             let mut files = Vec::new();
 
             for name in names {
-                let qapi = {
-                    let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
-                    let mut api = ApiBuilder::from_cache(cache)
-                        .with_progress(true)
-                        .with_token(get_token(token_source)?);
-                    if let Some(cache_dir) = crate::hf_hub_cache_dir() {
-                        api = api.with_cache_dir(cache_dir);
-                    }
-                    api.build().map_err(candle_core::Error::msg)?
-                };
+                let qapi = build_api(token_source, true).map_err(candle_core::Error::msg)?;
                 let qapi = qapi.repo(Repo::with_revision(
                     id.to_string(),
                     RepoType::Model,
@@ -397,7 +367,7 @@ pub fn get_model_paths(
             } else {
                 anyhow::bail!("Expected file with extension one of .safetensors, .pth, .pt, .bin.");
             };
-            info!(
+            trace!(
                 "Found model weight filenames {:?}",
                 files
                     .iter()
@@ -453,13 +423,13 @@ pub(crate) fn get_chat_template(
     } else if chat_template_ovrd.is_some() {
         None
     } else {
-        info!("No chat template file found. Chat template may be set via `chat_template.json` or processor config.");
+        debug!("No chat template file found. Chat template may be set via `chat_template.json` or processor config.");
         None
     };
     let mut template: ChatTemplate = match chat_template_ovrd {
         Some(chat_template) => {
             // In this case the override chat template is being used. The user must add the bos/eos/unk toks themselves.
-            info!("Using literal chat template.");
+            debug!("Using literal chat template.");
             let mut template = ChatTemplate::default();
             template.chat_template = Some(ChatTemplateValue(Either::Left(chat_template)));
             template
@@ -469,7 +439,7 @@ pub(crate) fn get_chat_template(
                 // Check if template_filename is a .jinja file
                 if let Some(template_filename) = paths.get_template_filename() {
                     if template_filename.extension().map(|e| e.to_str()) == Some(Some("jinja")) {
-                        info!("Using chat template from .jinja file.");
+                        debug!("Using chat template from .jinja file.");
                         // Load special tokens (bos/eos/unk) from tokenizer_config.json
                         // in the same directory, matching HF's behavior where
                         // apply_chat_template passes self.special_tokens_map to the template.

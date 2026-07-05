@@ -1,6 +1,6 @@
 //! Tool execution dispatch. Runs the tool and returns its output. `agentic_loop` handles message construction.
 
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, collections::HashSet, sync::Arc, time::Instant};
 
 use bm25::{Embedder, EmbedderBuilder, Language, ScoredDocument, Scorer};
 use tokenizers::InputSequence;
@@ -11,10 +11,15 @@ use crate::{
     get_mut_arcmutex,
     request::SearchContextSize,
     search::{self, ExtractFunctionParameters, SearchFunctionParameters, SearchResult},
-    ToolCallResponse, ToolCallbackKind, WebSearchOptions,
+    ToolCallResponse, ToolCallbackKind, WebSearchOptions, WebSearchReturnTokenBudget,
 };
 
 use super::Engine;
+
+const LOW_SEARCH_TOKEN_BUDGET: usize = 4096;
+const MEDIUM_SEARCH_TOKEN_BUDGET: usize = 8192;
+const HIGH_SEARCH_TOKEN_BUDGET: usize = 16384;
+const UNLIMITED_SEARCH_TOKEN_BUDGET: usize = HIGH_SEARCH_TOKEN_BUDGET;
 
 /// Tool call result, possibly multimodal.
 pub(super) struct ToolResult {
@@ -25,11 +30,77 @@ pub(super) struct ToolResult {
 }
 
 fn token_budget(opts: &WebSearchOptions) -> usize {
-    match opts.search_context_size.unwrap_or_default() {
-        SearchContextSize::High => 16384,
-        SearchContextSize::Medium => 8192,
-        SearchContextSize::Low => 4096,
+    match opts.return_token_budget.as_ref() {
+        Some(WebSearchReturnTokenBudget::Unlimited) => UNLIMITED_SEARCH_TOKEN_BUDGET,
+        Some(WebSearchReturnTokenBudget::Default) | None => {
+            match opts.search_context_size.unwrap_or_default() {
+                SearchContextSize::High => HIGH_SEARCH_TOKEN_BUDGET,
+                SearchContextSize::Medium => MEDIUM_SEARCH_TOKEN_BUDGET,
+                SearchContextSize::Low => LOW_SEARCH_TOKEN_BUDGET,
+            }
+        }
     }
+}
+
+fn normalized_filter_domain(domain: &str) -> String {
+    domain
+        .trim()
+        .trim_start_matches("www.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn domain_matches_filter(domain: &str, filter: &str) -> bool {
+    domain == filter
+        || domain
+            .strip_suffix(filter)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn domain_matches_any_filter(domain: &str, filters: &HashSet<String>) -> bool {
+    filters
+        .iter()
+        .any(|filter| domain_matches_filter(domain, filter))
+}
+
+fn apply_search_filters(results: Vec<SearchResult>, opts: &WebSearchOptions) -> Vec<SearchResult> {
+    let Some(filters) = &opts.filters else {
+        return results;
+    };
+    let allowed = filters.allowed_domains.as_ref().map(|domains| {
+        domains
+            .iter()
+            .map(|domain| normalized_filter_domain(domain))
+            .collect::<HashSet<_>>()
+    });
+    let blocked = filters.blocked_domains.as_ref().map(|domains| {
+        domains
+            .iter()
+            .map(|domain| normalized_filter_domain(domain))
+            .collect::<HashSet<_>>()
+    });
+
+    results
+        .into_iter()
+        .filter(|result| {
+            let Some(domain) = search::source_domain(&result.url) else {
+                return false;
+            };
+            if allowed
+                .as_ref()
+                .is_some_and(|allowed| !domain_matches_any_filter(&domain, allowed))
+            {
+                return false;
+            }
+            if blocked
+                .as_ref()
+                .is_some_and(|blocked| domain_matches_any_filter(&domain, blocked))
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
 }
 
 pub(super) async fn execute_search(
@@ -50,7 +121,7 @@ pub(super) async fn execute_search(
             };
         }
     };
-    tracing::info!("Called search tool with query `{}`.", params.query);
+    tracing::debug!("Called search tool with query `{}`.", params.query);
 
     let start = Instant::now();
     let tokenizer = get_mut_arcmutex!(engine.pipeline)
@@ -75,6 +146,7 @@ pub(super) async fn execute_search(
             }
         }
     };
+    let base = apply_search_filters(base, opts);
 
     let t_cap = Instant::now();
     let (results, result_token_lens): (Vec<SearchResult>, Vec<usize>) =
@@ -93,7 +165,7 @@ pub(super) async fn execute_search(
                 })
                 .unzip()
         });
-    tracing::info!(
+    tracing::debug!(
         "Search: content capping/tokenization took {:.2}s",
         t_cap.elapsed().as_secs_f32()
     );
@@ -176,13 +248,16 @@ pub(super) async fn execute_search(
         }
     }
 
-    tracing::info!(
+    tracing::debug!(
         "Search: ranking took {:.2}s",
         t_rank.elapsed().as_secs_f32()
     );
 
-    let content = serde_json::to_string(&serde_json::json!({ "output": used_results })).unwrap();
-    tracing::info!(
+    let sources = search::source_domains(used_results.iter().map(|result| result.url.as_str()));
+    let content =
+        serde_json::to_string(&serde_json::json!({ "sources": sources, "output": used_results }))
+            .unwrap();
+    tracing::debug!(
         "Web search executed in {:.2}s, using {used_len} tokens of {} search results.",
         (Instant::now() - start).as_secs_f32(),
         used_results.len()
@@ -214,7 +289,7 @@ pub(super) async fn execute_extraction(
             };
         }
     };
-    tracing::info!("Called extraction tool with url `{}`.", params.url);
+    tracing::debug!("Called extraction tool with url `{}`.", params.url);
 
     let start = Instant::now();
     let tokenizer = get_mut_arcmutex!(engine.pipeline)
@@ -266,13 +341,14 @@ pub(super) async fn execute_extraction(
             .map(|x| x.len())
             .unwrap_or(usize::MAX)
     };
-    tracing::info!(
+    tracing::debug!(
         "Extraction executed in {:.2}s, using {used_len} tokens.",
         (Instant::now() - start).as_secs_f32(),
     );
+    let sources = search::source_domains([params.url.as_str()]);
 
     ToolResult {
-        content: format!("{{\"output\": \"{content}\"}}"),
+        content: serde_json::json!({"sources": sources, "output": content}).to_string(),
         images: vec![],
         video_frames: vec![],
         files: vec![],

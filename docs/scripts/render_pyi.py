@@ -12,7 +12,9 @@ Run from the repo root or the docs directory.
 
 from __future__ import annotations
 
+import argparse
 import ast
+import difflib
 import re
 import sys
 from pathlib import Path
@@ -31,7 +33,7 @@ GROUPS = [
         "Runner",
         "runner",
         "The main entry point. Load a model and send requests.",
-        ["Runner"],
+        ["Runner", "CalibrationStatus"],
     ),
     (
         "Which",
@@ -86,6 +88,12 @@ GROUPS = [
             "ImageGenerationResponseFormat",
             "ToolChoice",
             "SearchContextSize",
+            "AgentPermission",
+            "CodeExecutionPermission",
+            "NetworkMode",
+            "AgentToolSource",
+            "AgentToolKind",
+            "AgentToolApprovalDecisionKind",
             "PagedCacheType",
         ],
     ),
@@ -102,16 +110,22 @@ GROUPS = [
         ["AnyMoeExpertType", "AnyMoeConfig"],
     ),
     (
-        "Code execution",
+        "Code and shell execution",
         "code-execution",
-        "Configuration for the built-in Python code executor.",
-        ["SandboxPolicy", "CodeExecutionConfig"],
+        "Configuration for the built-in Python and shell executors.",
+        ["SandboxPolicy", "CodeExecutionConfig", "ShellConfig", "ShellSkillMount"],
+    ),
+    (
+        "Agent approvals",
+        "agent-approvals",
+        "Request and decision types for agent action approval callbacks.",
+        ["AgentToolMetadata", "AgentToolApproval", "AgentToolApprovalDecision"],
     ),
     (
         "Files",
         "files",
-        "First-class output files surfaced from agentic runs.",
-        ["RequestedFile", "FileSource", "File"],
+        "Input files and first-class output files surfaced from agentic runs.",
+        ["RequestedFile", "InputFile", "FileSource", "File"],
     ),
     (
         "MCP",
@@ -200,9 +214,7 @@ def _format_signature_block(func_name: str, func: ast.FunctionDef) -> str:
 
 
 # Matches a docstring "Args:" block and captures indented argument descriptions.
-ARGS_SECTION_RE = re.compile(
-    r"(?m)^[ \t]*Args?\s*:\s*\n(?P<body>(?:[ \t]+[^\n]*\n?)+)"
-)
+ARGS_SECTION_RE = re.compile(r"(?m)^[ \t]*Args?\s*:\s*\n(?P<body>(?:[ \t]+[^\n]*\n?)+)")
 RETURNS_SECTION_RE = re.compile(
     r"(?m)^[ \t]*Returns?\s*:\s*\n(?P<body>(?:[ \t]+[^\n]*\n?)+)"
 )
@@ -302,14 +314,14 @@ def _render_params_table(
         type_cell = _md_code_cell(ann)
         default_cell = _md_code_cell(default) if default is not None else "required"
         desc = _md_escape_cell(param_docs.get(name, ""))
-        lines.append(
-            f"| `{name}` | {type_cell} | {default_cell} | {desc} |"
-        )
+        lines.append(f"| `{name}` | {type_cell} | {default_cell} | {desc} |")
     lines.append("")
     return "\n".join(lines)
 
 
-def _render_function(func: ast.FunctionDef, heading: str, owner: str | None = None) -> str:
+def _render_function(
+    func: ast.FunctionDef, heading: str, owner: str | None = None
+) -> str:
     display_name = "__init__" if func.name == "__init__" else func.name
     anchor = f"{owner}.{display_name}" if owner else display_name
 
@@ -347,9 +359,7 @@ def _render_function(func: ast.FunctionDef, heading: str, owner: str | None = No
     return "\n".join(lines)
 
 
-def _render_fields_table(
-    owner: str, fields: list[tuple[str, str, str]]
-) -> str:
+def _render_fields_table(owner: str, fields: list[tuple[str, str, str]]) -> str:
     has_default = any(v for _, _, v in fields)
     if has_default:
         lines = [
@@ -376,9 +386,9 @@ def _render_enum_table(owner: str, values: list[tuple[str, str]]) -> str:
     has_value = any(v for _, v in values)
     if has_value:
         lines = [
-            "Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.",
+            "Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.",
             "",
-            "| Member | Config name |",
+            "| Member | Wire/config name |",
             "| --- | --- |",
         ]
         for name, value in values:
@@ -395,7 +405,9 @@ def _render_enum_table(owner: str, values: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def _render_class(cls: ast.ClassDef, heading: str = "###", parent: str | None = None) -> str:
+def _render_class(
+    cls: ast.ClassDef, heading: str = "###", parent: str | None = None
+) -> str:
     is_enum = _is_enum(cls)
     full_name = f"{parent}.{cls.name}" if parent else cls.name
     lines: list[str] = [f"{heading} `{full_name}`", ""]
@@ -498,15 +510,13 @@ def _render_index() -> str:
         "",
         "## Install",
         "",
-        "One wheel per accelerator. All wheels expose the same `mistralrs` module.",
+        "`pip install mistralrs` covers CPU (Linux, Windows) and Metal (macOS arm64). CUDA wheels are GitHub release assets with `+cudaNNN.smNN` versions. See [Python SDK getting started](/mistral.rs/guides/python/getting-started/#installing) for install commands and [hardware support](/mistral.rs/reference/hardware-support/) for compute capabilities.",
         "",
-        "| Accelerator | Package |",
-        "| --- | --- |",
-        "| CPU (or Intel CPU with MKL) | `pip install mistralrs` |",
-        "| NVIDIA GPU | `pip install mistralrs-cuda` |",
-        "| Apple Silicon | `pip install mistralrs-metal` |",
-        "| Intel MKL (pinned) | `pip install mistralrs-mkl` |",
-        "| macOS Accelerate | `pip install mistralrs-accelerate` |",
+        "```bash",
+        "pip install mistralrs                                   # CPU / Metal (PyPI)",
+        'pip install "mistralrs==0.8.23+cuda128.sm89" \\          # NVIDIA (replace version, CUDA level, and SM)',
+        "  --find-links https://github.com/EricLBuehler/mistral.rs/releases/expanded_assets/v0.8.23",
+        "```",
         "",
         "## Pages",
         "",
@@ -514,12 +524,10 @@ def _render_index() -> str:
         "| --- | --- |",
     ]
     for title, slug, desc, _ in GROUPS:
-        lines.append(
-            f"| [{title}](/mistral.rs/reference/python/{slug}/) | {desc} |"
-        )
+        lines.append(f"| [{title}](/mistral.rs/reference/python/{slug}/) | {desc} |")
     lines.append("")
     lines.append(
-        "See [Tutorial 3](/mistral.rs/tutorials/03-python-sdk/) for a walkthrough and the [Python guides](/mistral.rs/guides/python/) for task-oriented recipes."
+        "See [Python getting started](/mistral.rs/guides/python/getting-started/) for a walkthrough and the [Python guides](/mistral.rs/guides/python/) for task-oriented recipes."
     )
     lines.append("")
     lines.append("---")
@@ -539,27 +547,59 @@ def _collect_classes(tree: ast.Module) -> dict[str, ast.ClassDef]:
     return out
 
 
+def _render_pages(classes_by_name: dict[str, ast.ClassDef]) -> dict[str, str]:
+    pages = {"index.md": _render_index()}
+    for i, (title, slug, desc, names) in enumerate(GROUPS, start=2):
+        pages[f"{slug}.md"] = _render_page(title, desc, names, classes_by_name, i)
+    return pages
+
+
+def _check(pages: dict[str, str]) -> int:
+    committed = {p.name: p.read_text() for p in OUT_DIR.glob("*.md")}
+    drift = False
+    for name in sorted(set(pages) - set(committed)):
+        print(f"missing: {OUT_DIR / name}", file=sys.stderr)
+        drift = True
+    for name in sorted(set(committed) - set(pages)):
+        print(f"stale: {OUT_DIR / name} (no longer generated)", file=sys.stderr)
+        drift = True
+    for name in sorted(set(pages) & set(committed)):
+        if pages[name] != committed[name]:
+            drift = True
+            diff = difflib.unified_diff(
+                committed[name].splitlines(keepends=True),
+                pages[name].splitlines(keepends=True),
+                fromfile=f"committed/{name}",
+                tofile=f"generated/{name}",
+            )
+            sys.stderr.writelines(diff)
+    if drift:
+        print(
+            f"error: generated Python reference is out of date with {STUB_REL}; "
+            "run `python docs/scripts/render_pyi.py` and commit the result",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"ok: {OUT_DIR} is up to date with {STUB_REL}")
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="verify committed pages match the .pyi instead of writing",
+    )
+    opts = parser.parse_args()
+
     if not PYI_PATH.exists():
         print(f"error: {PYI_PATH} does not exist", file=sys.stderr)
         return 1
     source = PYI_PATH.read_text()
     tree = ast.parse(source)
     classes_by_name = _collect_classes(tree)
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Clean previous output so removed classes do not linger.
-    for existing in OUT_DIR.glob("*.md"):
-        existing.unlink()
-
-    (OUT_DIR / "index.md").write_text(_render_index())
-    print(f"wrote {OUT_DIR / 'index.md'}")
-
-    for i, (title, slug, desc, names) in enumerate(GROUPS, start=2):
-        page = _render_page(title, desc, names, classes_by_name, i)
-        path = OUT_DIR / f"{slug}.md"
-        path.write_text(page)
-        print(f"wrote {path}")
+    pages = _render_pages(classes_by_name)
 
     documented = {n for _, _, _, names in GROUPS for n in names}
     uncovered = sorted(set(classes_by_name) - documented)
@@ -569,6 +609,18 @@ def main() -> int:
             + ", ".join(uncovered),
             file=sys.stderr,
         )
+
+    if opts.check:
+        return _check(pages)
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Clean previous output so removed classes do not linger.
+    for existing in OUT_DIR.glob("*.md"):
+        existing.unlink()
+    for name, content in pages.items():
+        path = OUT_DIR / name
+        path.write_text(content)
+        print(f"wrote {path}")
 
     return 0
 

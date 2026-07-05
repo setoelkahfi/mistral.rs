@@ -6,9 +6,9 @@ sidebar:
 ---
 ## `Architecture`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `Architecture.Mistral` | `'mistral'` |
 | `Architecture.Gemma` | `'gemma'` |
@@ -31,13 +31,15 @@ Members and the corresponding config / serde names (used in TOML and the `arch` 
 | `Architecture.GraniteMoeHybrid` | `'granitemoehybrid'` |
 | `Architecture.GptOss` | `'gptoss'` |
 | `Architecture.Qwen3Next` | `'qwen3next'` |
+| `Architecture.Lfm2` | `'lfm2'` |
+| `Architecture.Lfm2Moe` | `'lfm2_moe'` |
 
 
 ## `EmbeddingArchitecture`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `EmbeddingArchitecture.EmbeddingGemma` | `'embeddinggemma'` |
 | `EmbeddingArchitecture.Qwen3Embedding` | `'qwen3embedding'` |
@@ -45,14 +47,15 @@ Members and the corresponding config / serde names (used in TOML and the `arch` 
 
 ## `MultimodalArchitecture`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `MultimodalArchitecture.Phi3V` | `'phi3v'` |
 | `MultimodalArchitecture.Idefics2` | `'idefics2'` |
 | `MultimodalArchitecture.LLaVANext` | `'llava-next'` |
 | `MultimodalArchitecture.LLaVA` | `'llava'` |
+| `MultimodalArchitecture.Lfm2Vl` | `'lfm2vl'` |
 | `MultimodalArchitecture.VLlama` | `'vllama'` |
 | `MultimodalArchitecture.Qwen2VL` | `'qwen2vl'` |
 | `MultimodalArchitecture.Idefics3` | `'idefics3'` |
@@ -69,13 +72,14 @@ Members and the corresponding config / serde names (used in TOML and the `arch` 
 | `MultimodalArchitecture.Qwen3_5Moe` | `'Qwen3_5Moe'` |
 | `MultimodalArchitecture.Voxtral` | `'Voxtral'` |
 | `MultimodalArchitecture.Gemma4` | `'Gemma4'` |
+| `MultimodalArchitecture.DiffusionGemma` | `'DiffusionGemma'` |
 
 
 ## `DiffusionArchitecture`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `DiffusionArchitecture.Flux` | `'flux'` |
 | `DiffusionArchitecture.FluxOffloaded` | `'flux-offloaded'` |
@@ -83,18 +87,18 @@ Members and the corresponding config / serde names (used in TOML and the `arch` 
 
 ## `SpeechLoaderType`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `SpeechLoaderType.Dia` | `'Dia'` |
 
 
 ## `ModelDType`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `ModelDType.Auto` | `'auto'` |
 | `ModelDType.BF16` | `'bf16'` |
@@ -104,9 +108,9 @@ Members and the corresponding config / serde names (used in TOML and the `arch` 
 
 ## `IsqOrganization`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `IsqOrganization.Default` | `'default'` |
 | `IsqOrganization.MoQE` | `'moqe'` |
@@ -114,9 +118,9 @@ Members and the corresponding config / serde names (used in TOML and the `arch` 
 
 ## `ImageGenerationResponseFormat`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `ImageGenerationResponseFormat.Url` | `'Url'` |
 | `ImageGenerationResponseFormat.B64Json` | `'B64Json'` |
@@ -124,9 +128,9 @@ Members and the corresponding config / serde names (used in TOML and the `arch` 
 
 ## `ToolChoice`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `ToolChoice.NoTools` | `'None'` |
 | `ToolChoice.Auto` | `'Auto'` |
@@ -134,20 +138,89 @@ Members and the corresponding config / serde names (used in TOML and the `arch` 
 
 ## `SearchContextSize`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `SearchContextSize.Low` | `'low'` |
 | `SearchContextSize.Medium` | `'medium'` |
 | `SearchContextSize.High` | `'high'` |
 
 
+## `AgentPermission`
+
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
+
+| Member | Wire/config name |
+| --- | --- |
+| `AgentPermission.Auto` | `'auto'` |
+| `AgentPermission.Ask` | `'ask'` |
+| `AgentPermission.Deny` | `'deny'` |
+
+
+## `CodeExecutionPermission`
+
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
+
+| Member | Wire/config name |
+| --- | --- |
+| `CodeExecutionPermission.Auto` | `'auto'` |
+| `CodeExecutionPermission.Ask` | `'ask'` |
+| `CodeExecutionPermission.Deny` | `'deny'` |
+
+
+## `NetworkMode`
+
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
+
+| Member | Wire/config name |
+| --- | --- |
+| `NetworkMode.NoNetwork` | `'none'` |
+| `NetworkMode.Loopback` | `'loopback'` |
+| `NetworkMode.Full` | `'full'` |
+
+
+## `AgentToolSource`
+
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
+
+| Member | Wire/config name |
+| --- | --- |
+| `AgentToolSource.BuiltIn` | `'built_in'` |
+| `AgentToolSource.User` | `'user'` |
+| `AgentToolSource.Mcp` | `'mcp'` |
+| `AgentToolSource.External` | `'external'` |
+
+
+## `AgentToolKind`
+
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
+
+| Member | Wire/config name |
+| --- | --- |
+| `AgentToolKind.CodeExecution` | `'code_execution'` |
+| `AgentToolKind.WebSearch` | `'web_search'` |
+| `AgentToolKind.Shell` | `'shell'` |
+| `AgentToolKind.File` | `'file'` |
+| `AgentToolKind.Custom` | `'custom'` |
+| `AgentToolKind.External` | `'external'` |
+
+
+## `AgentToolApprovalDecisionKind`
+
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
+
+| Member | Wire/config name |
+| --- | --- |
+| `AgentToolApprovalDecisionKind.Approve` | `'approve'` |
+| `AgentToolApprovalDecisionKind.Deny` | `'deny'` |
+
+
 ## `PagedCacheType`
 
-Members and the corresponding config / serde names (used in TOML and the `arch` HTTP field). The members are fieldless PyO3 enum variants and do not expose `.value`.
+Members and their wire/config names where relevant. The members are fieldless PyO3 enum variants and do not expose `.value`.
 
-| Member | Config name |
+| Member | Wire/config name |
 | --- | --- |
 | `PagedCacheType.Auto` | `0` |
 | `PagedCacheType.F8E4M3` | `1` |
