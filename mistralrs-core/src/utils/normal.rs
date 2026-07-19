@@ -135,7 +135,9 @@ fn determine_auto_dtype_all(devices: &[&Device]) -> candle_core::Result<DType> {
     #[cfg(not(any(feature = "accelerate", target_os = "ios")))]
     {
         // f16 passes the probe matmul on CPU but its range is too small for modern residual
-        // streams (gemma activations exceed 65504), and candle's CPU bf16 matmul is unsupported.
+        // streams (gemma activations exceed 65504). bf16 runs correctly (FEAT_BF16 kernels) but
+        // taxes every elementwise op with converts while ISQ + the f16 KV cache already bank the
+        // memory wins, so f32 activations stay the default until a native bf16 op pass lands.
         if devices.iter().all(|d| matches!(d, Device::Cpu)) {
             return Ok(DType::F32);
         }

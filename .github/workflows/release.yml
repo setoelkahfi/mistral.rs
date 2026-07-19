@@ -89,9 +89,17 @@ jobs:
       matrix:
         include:
           - { runner: ubuntu-latest, triple: x86_64-unknown-linux-gnu }
-          - { runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu,
+              # v8.2 floor (Graviton2+, Pi 5, 2018+ phones): recovers autovec perf the
+              # runtime-dispatched kernels cannot; the installer probes /proc/cpuinfo
+              rustflags: "-C target-cpu=generic -C target-feature=+dotprod,+fp16,+fhm",
+              skip_wheel: true }
+          - { runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu,
+              # ARMv8.0 compat asset and portable manylinux wheel (Pi 4, Graviton1,
+              # A72-class SBCs)
+              suffix: -v8_0 }
     env:
-      RUSTFLAGS: "-C target-cpu=generic"
+      RUSTFLAGS: ${{ matrix.rustflags || '-C target-cpu=generic' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,7 +115,7 @@ jobs:
       - name: Build
         run: cargo build --release --locked --offline -p mistralrs-cli
       - name: Package
-        run: tar czf mistralrs-cpu-${{ matrix.triple }}.tar.gz -C target/release mistralrs
+        run: tar czf mistralrs-cpu-${{ matrix.triple }}${{ matrix.suffix }}.tar.gz -C target/release mistralrs
       - uses: softprops/action-gh-release@v2
         id: upload_release_asset
         if: ${{ !inputs.dry_run }}
@@ -115,14 +123,15 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
-          files: mistralrs-cpu-${{ matrix.triple }}.tar.gz
+          files: mistralrs-cpu-${{ matrix.triple }}${{ matrix.suffix }}.tar.gz
       - uses: softprops/action-gh-release@v2
         if: ${{ !inputs.dry_run && steps.upload_release_asset.outcome == 'failure' }}
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
-          files: mistralrs-cpu-${{ matrix.triple }}.tar.gz
+          files: mistralrs-cpu-${{ matrix.triple }}${{ matrix.suffix }}.tar.gz
       - name: Build wheel (manylinux)
+        if: ${{ !matrix.skip_wheel }}
         uses: PyO3/maturin-action@v1
         with:
           working-directory: mistralrs-pyo3
@@ -130,6 +139,7 @@ jobs:
           args: --release --out dist
           manylinux: auto
       - uses: actions/upload-artifact@v4
+        if: ${{ !matrix.skip_wheel }}
         with:
           name: wheel-${{ matrix.triple }}
           path: mistralrs-pyo3/dist/*.whl
@@ -369,7 +379,7 @@ jobs:
             -p mistralrs-cpu-x86_64-unknown-linux-gnu.tar.gz -O amd64.tar.gz
           tar xzf amd64.tar.gz -C dist/amd64
           gh release download "$TAG" -R "${{ github.repository }}" \
-            -p mistralrs-cpu-aarch64-unknown-linux-gnu.tar.gz -O arm64.tar.gz
+            -p mistralrs-cpu-aarch64-unknown-linux-gnu-v8_0.tar.gz -O arm64.tar.gz
           tar xzf arm64.tar.gz -C dist/arm64
       - name: Version tag
         id: ver

@@ -470,7 +470,7 @@ pub enum MistralRsError {
 
 impl std::fmt::Display for MistralRsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", &self)
+        write!(f, "{:?}", self)
     }
 }
 
@@ -666,7 +666,7 @@ impl Drop for MistralRs {
     fn drop(&mut self) {
         // Terminate all engines
         if let Ok(engines) = self.engines.read() {
-            for (_, engine) in engines.iter() {
+            for engine in engines.values() {
                 // Use try_send instead of blocking_send to avoid runtime panics
                 engine.terminate();
             }
@@ -1148,9 +1148,13 @@ impl MistralRs {
         let is_multi_threaded = tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread);
 
-        // Do a dummy run
+        // Do a dummy run; skip UQFF writes, whose CPU-resident model cannot serve requests.
+        let loaded_for_uqff_write = get_mut_arcmutex!(pipeline)
+            .get_metadata()
+            .loaded_for_uqff_write;
         if !distributed::is_daemon()
             && is_multi_threaded
+            && !loaded_for_uqff_write
             && matches!(
                 engine_instance.category,
                 ModelCategory::Text | ModelCategory::Multimodal { .. }

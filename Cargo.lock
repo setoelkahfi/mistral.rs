@@ -544,6 +544,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -640,7 +649,7 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=78e1d85#78e1d851853053202eda5b3d4da27f2380b0609b"
+source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -673,7 +682,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn-v3"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=78e1d85#78e1d851853053202eda5b3d4da27f2380b0609b"
+source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -686,7 +695,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=78e1d85#78e1d851853053202eda5b3d4da27f2380b0609b"
+source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "cudaforge",
 ]
@@ -694,7 +703,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=78e1d85#78e1d851853053202eda5b3d4da27f2380b0609b"
+source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "block2",
  "half",
@@ -709,7 +718,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=78e1d85#78e1d851853053202eda5b3d4da27f2380b0609b"
+source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -728,7 +737,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=78e1d85#78e1d851853053202eda5b3d4da27f2380b0609b"
+source = "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -1361,16 +1370,6 @@ dependencies = [
 
 [[package]]
 name = "darling"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
-dependencies = [
- "darling_core 0.21.3",
- "darling_macro 0.21.3",
-]
-
-[[package]]
-name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
@@ -1398,20 +1397,6 @@ name = "darling_core"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e"
-dependencies = [
- "fnv",
- "ident_case",
- "proc-macro2",
- "quote",
- "strsim 0.11.1",
- "syn 2.0.114",
-]
-
-[[package]]
-name = "darling_core"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
 dependencies = [
  "fnv",
  "ident_case",
@@ -1452,17 +1437,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
 dependencies = [
  "darling_core 0.20.11",
- "quote",
- "syn 2.0.114",
-]
-
-[[package]]
-name = "darling_macro"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
-dependencies = [
- "darling_core 0.21.3",
  "quote",
  "syn 2.0.114",
 ]
@@ -3312,6 +3286,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3616,6 +3599,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3681,7 +3673,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3707,7 +3699,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-audio"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "apodize",
@@ -3717,7 +3709,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-cli"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3736,6 +3728,7 @@ dependencies = [
  "image",
  "include_dir",
  "indexmap 2.13.0",
+ "mimalloc",
  "mime_guess",
  "mistralrs",
  "mistralrs-core",
@@ -3757,7 +3750,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-code-exec"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3775,7 +3768,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "accelerate-src",
  "ahash",
@@ -3882,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-flash-attn"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3893,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-macros"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -3903,7 +3896,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-mcp"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3925,7 +3918,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-metal-compile"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "candle-metal-kernels",
  "objc2-metal",
@@ -3933,7 +3926,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-paged-attn"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3950,7 +3943,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-pyo3"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "accelerate-src",
  "anyhow",
@@ -3976,7 +3969,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-quant"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -4017,7 +4010,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-sandbox"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "itoa",
@@ -4033,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-server-core"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "accelerate-src",
  "anyhow",
@@ -4067,7 +4060,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-vision"
-version = "0.8.23"
+version = "0.9.0"
 dependencies = [
  "candle-core",
  "image",
@@ -6095,11 +6088,12 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.16.1"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fa237f2807440d238e0364a218270b98f767a00d3dada77b1c53ae88940e2e7"
+checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
  "base64 0.22.1",
+ "bs58",
  "chrono",
  "hex",
  "indexmap 1.9.3",
@@ -6114,11 +6108,11 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.16.1"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52a8e3ca0ca629121f70ab50f95249e5a6f925cc0f6ffe8256c45b728875706c"
+checksum = "84d57bc0c8b9a17920c178daa6bb924850d54a9c97ab45194bb8c17ad66bb660"
 dependencies = [
- "darling 0.21.3",
+ "darling 0.23.0",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
