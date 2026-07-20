@@ -1,5 +1,5 @@
 [package]
-name = "mistralrs-vision"
+name = "onde-mistralrs-vision"
 readme = "../README.md"
 authors = ["Eric Buehler"]
 version.workspace = true

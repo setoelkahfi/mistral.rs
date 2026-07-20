@@ -1,5 +1,5 @@
 [package]
-name = "mistralrs-audio"
+name = "onde-mistralrs-audio"
 readme = "../README.md"
 authors = ["Eric Buehler"]
 version.workspace = true

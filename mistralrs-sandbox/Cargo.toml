@@ -1,5 +1,5 @@
 [package]
-name = "mistralrs-sandbox"
+name = "onde-mistralrs-sandbox"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

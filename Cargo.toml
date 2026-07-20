@@ -20,7 +20,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 description = "Fast, flexible LLM inference."
 homepage = "https://github.com/EricLBuehler/mistral.rs"
@@ -31,14 +31,13 @@ license = "MIT"
 rust-version = "1.94"
 
 [workspace.dependencies]
-# candle-core = { version = "0.11.0" }
-# candle-nn = { version = "0.11.0" }
-# candle-flash-attn-v3 = { version = "0.11.0" }
-# candle-metal-kernels = { version = "0.11.0" }
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.11.0", rev = "27f20fea993c81ea6d32ce44018f42b68466525e" }
-candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.11.0", rev = "27f20fea993c81ea6d32ce44018f42b68466525e" }
-candle-flash-attn-v3 = { git = "https://github.com/huggingface/candle.git", version = "0.11.0", rev = "27f20fea993c81ea6d32ce44018f42b68466525e" }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", version = "0.11.0", rev = "27f20fea993c81ea6d32ce44018f42b68466525e" }
+# onde-candle-{core,nn} are the upstream candle rev 27f20fea snapshot published to
+# crates.io (mistral.rs needs post-0.11.0 APIs); metal-kernels and flash-attn-v3 are
+# unchanged at that rev, so the official crates serve them.
+candle-core = { version = "0.11.0", package = "onde-candle-core" }
+candle-nn = { version = "0.11.0", package = "onde-candle-nn" }
+candle-flash-attn-v3 = { version = "0.11.0" }
+candle-metal-kernels = { version = "0.11.0" }
 
 axum = "0.8.8"
 mimalloc = "0.1"
@@ -107,7 +106,7 @@ dirs = "6.0.0"
 thiserror = "2.0.18"
 tokenizers = { version = "0.21.4", default-features = false }
 tokio-tungstenite = "0.28.0"
-tqdm = { git = "https://github.com/setoelkahfi/tqdm", branch = "deps/bump-crossterm" }
+tqdm = { git = "https://github.com/setoelkahfi/tqdm", branch = "deps/bump-crossterm", version = "0.8.0" }
 chrono = "0.4.43"
 minijinja = { version = "2.14.0", features = ["builtins", "json"] }
 minijinja-contrib = { version = "2.14.0", features = ["pycompat"] }
@@ -190,19 +189,19 @@ cuda-core = "=0.1.0"
 cuda-async = "=0.1.0"
 cuda-bindings = "=0.1.0"
 
-mistralrs-core = { path = "mistralrs-core", version = "0.9.0" }
-mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.9.0" }
-mistralrs-metal-compile = { path = "mistralrs-metal-compile", version = "0.9.0" }
-mistralrs-flash-attn = { path = "mistralrs-flash-attn", version = "0.9.0" }
-mistralrs-quant = { path = "mistralrs-quant", version = "0.9.0" }
-mistralrs-vision = { path = "mistralrs-vision", version = "0.9.0" }
-mistralrs-server-core = { path = "mistralrs-server-core", version = "0.9.0" }
-mistralrs = { path = "mistralrs", version = "0.9.0" }
-mistralrs-audio = { path = "mistralrs-audio", version = "0.9.0" }
-mistralrs-mcp = { path = "mistralrs-mcp", version = "0.9.0" }
-mistralrs-macros = { path = "mistralrs-macros", version = "0.9.0" }
-mistralrs-code-exec = { path = "mistralrs-code-exec", version = "0.9.0" }
-mistralrs-sandbox = { path = "mistralrs-sandbox", version = "0.9.0" }
+mistralrs-core = { path = "mistralrs-core", version = "0.9.1", package = "onde-mistralrs-core" }
+mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.9.1", package = "onde-mistralrs-paged-attn" }
+mistralrs-metal-compile = { path = "mistralrs-metal-compile", version = "0.9.1", package = "onde-mistralrs-metal-compile" }
+mistralrs-flash-attn = { path = "mistralrs-flash-attn", version = "0.9.1", package = "onde-mistralrs-flash-attn" }
+mistralrs-quant = { path = "mistralrs-quant", version = "0.9.1", package = "onde-mistralrs-quant" }
+mistralrs-vision = { path = "mistralrs-vision", version = "0.9.1", package = "onde-mistralrs-vision" }
+mistralrs-server-core = { path = "mistralrs-server-core", version = "0.9.1" }
+mistralrs = { path = "mistralrs", version = "0.9.1", package = "onde-mistralrs" }
+mistralrs-audio = { path = "mistralrs-audio", version = "0.9.1", package = "onde-mistralrs-audio" }
+mistralrs-mcp = { path = "mistralrs-mcp", version = "0.9.1", package = "onde-mistralrs-mcp" }
+mistralrs-macros = { path = "mistralrs-macros", version = "0.9.1", package = "onde-mistralrs-macros" }
+mistralrs-code-exec = { path = "mistralrs-code-exec", version = "0.9.1", package = "onde-mistralrs-code-exec" }
+mistralrs-sandbox = { path = "mistralrs-sandbox", version = "0.9.1", package = "onde-mistralrs-sandbox" }
 
 # Use forked sysctl with watchOS (target_os = "watchos") support until upstream merges it.
 # Upstream PR: https://github.com/johalun/sysctl-rs/pull/XXX

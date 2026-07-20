@@ -1,5 +1,5 @@
 [package]
-name = "mistralrs-flash-attn"
+name = "onde-mistralrs-flash-attn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

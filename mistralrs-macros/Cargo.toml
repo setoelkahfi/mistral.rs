@@ -1,5 +1,5 @@
 [package]
-name = "mistralrs-macros"
+name = "onde-mistralrs-macros"
 readme = "../README.md"
 authors = ["Eric Buehler"]
 version.workspace = true
