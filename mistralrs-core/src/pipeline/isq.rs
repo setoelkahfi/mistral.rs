@@ -399,7 +399,10 @@ pub(crate) struct UqffWriteRequest<'a> {
     pub imatrix: std::collections::HashMap<String, Vec<f32>>,
 }
 
+#[cfg(target_pointer_width = "64")]
 const MAX_UQFF_SIZE_BYTES: usize = 10 * 1024 * 1024 * 1024;
+#[cfg(not(target_pointer_width = "64"))]
+const MAX_UQFF_SIZE_BYTES: usize = usize::MAX;
 
 pub(crate) fn write_uqff_artifacts(request: UqffWriteRequest<'_>) -> Result<()> {
     let UqffWriteRequest {

@@ -20,7 +20,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 description = "Fast, flexible LLM inference."
 homepage = "https://github.com/EricLBuehler/mistral.rs"
@@ -189,19 +189,19 @@ cuda-core = "=0.1.0"
 cuda-async = "=0.1.0"
 cuda-bindings = "=0.1.0"
 
-mistralrs-core = { path = "mistralrs-core", version = "0.9.1", package = "onde-mistralrs-core" }
-mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.9.1", package = "onde-mistralrs-paged-attn" }
-mistralrs-metal-compile = { path = "mistralrs-metal-compile", version = "0.9.1", package = "onde-mistralrs-metal-compile" }
-mistralrs-flash-attn = { path = "mistralrs-flash-attn", version = "0.9.1", package = "onde-mistralrs-flash-attn" }
-mistralrs-quant = { path = "mistralrs-quant", version = "0.9.1", package = "onde-mistralrs-quant" }
-mistralrs-vision = { path = "mistralrs-vision", version = "0.9.1", package = "onde-mistralrs-vision" }
-mistralrs-server-core = { path = "mistralrs-server-core", version = "0.9.1" }
-mistralrs = { path = "mistralrs", version = "0.9.1", package = "onde-mistralrs" }
-mistralrs-audio = { path = "mistralrs-audio", version = "0.9.1", package = "onde-mistralrs-audio" }
-mistralrs-mcp = { path = "mistralrs-mcp", version = "0.9.1", package = "onde-mistralrs-mcp" }
-mistralrs-macros = { path = "mistralrs-macros", version = "0.9.1", package = "onde-mistralrs-macros" }
-mistralrs-code-exec = { path = "mistralrs-code-exec", version = "0.9.1", package = "onde-mistralrs-code-exec" }
-mistralrs-sandbox = { path = "mistralrs-sandbox", version = "0.9.1", package = "onde-mistralrs-sandbox" }
+mistralrs-core = { path = "mistralrs-core", version = "0.9.2", package = "onde-mistralrs-core" }
+mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.9.2", package = "onde-mistralrs-paged-attn" }
+mistralrs-metal-compile = { path = "mistralrs-metal-compile", version = "0.9.2", package = "onde-mistralrs-metal-compile" }
+mistralrs-flash-attn = { path = "mistralrs-flash-attn", version = "0.9.2", package = "onde-mistralrs-flash-attn" }
+mistralrs-quant = { path = "mistralrs-quant", version = "0.9.2", package = "onde-mistralrs-quant" }
+mistralrs-vision = { path = "mistralrs-vision", version = "0.9.2", package = "onde-mistralrs-vision" }
+mistralrs-server-core = { path = "mistralrs-server-core", version = "0.9.2" }
+mistralrs = { path = "mistralrs", version = "0.9.2", package = "onde-mistralrs" }
+mistralrs-audio = { path = "mistralrs-audio", version = "0.9.2", package = "onde-mistralrs-audio" }
+mistralrs-mcp = { path = "mistralrs-mcp", version = "0.9.2", package = "onde-mistralrs-mcp" }
+mistralrs-macros = { path = "mistralrs-macros", version = "0.9.2", package = "onde-mistralrs-macros" }
+mistralrs-code-exec = { path = "mistralrs-code-exec", version = "0.9.2", package = "onde-mistralrs-code-exec" }
+mistralrs-sandbox = { path = "mistralrs-sandbox", version = "0.9.2", package = "onde-mistralrs-sandbox" }
 
 # Use forked sysctl with watchOS (target_os = "watchos") support until upstream merges it.
 # Upstream PR: https://github.com/johalun/sysctl-rs/pull/XXX
