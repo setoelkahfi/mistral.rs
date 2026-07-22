@@ -20,7 +20,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 description = "Fast, flexible LLM inference."
 homepage = "https://github.com/EricLBuehler/mistral.rs"
@@ -106,7 +106,13 @@ dirs = "6.0.0"
 thiserror = "2.0.18"
 tokenizers = { version = "0.21.4", default-features = false }
 tokio-tungstenite = "0.28.0"
-tqdm = { git = "https://github.com/setoelkahfi/tqdm", branch = "deps/bump-crossterm", version = "0.8.0" }
+# onde-tqdm is the crossterm-0.29 tqdm fork published to crates.io. It MUST be a
+# registry dep (not git): cargo publish strips git deps, so a git tqdm fork never
+# reaches downstream registry consumers (onde). The registry onde-tqdm carries
+# crossterm 0.29 (→ mio 1.x) through publish and lets onde drop its mio 0.8.11
+# visionOS patch. Publish onde-tqdm before republishing the onde-mistralrs-* crates.
+# Upstream crossterm bump PR: https://github.com/mrlazy1708/tqdm/pull/28
+tqdm = { version = "0.8.2", package = "onde-tqdm" }
 chrono = "0.4.43"
 minijinja = { version = "2.14.0", features = ["builtins", "json"] }
 minijinja-contrib = { version = "2.14.0", features = ["pycompat"] }
@@ -189,29 +195,25 @@ cuda-core = "=0.1.0"
 cuda-async = "=0.1.0"
 cuda-bindings = "=0.1.0"
 
-mistralrs-core = { path = "mistralrs-core", version = "0.9.2", package = "onde-mistralrs-core" }
-mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.9.2", package = "onde-mistralrs-paged-attn" }
-mistralrs-metal-compile = { path = "mistralrs-metal-compile", version = "0.9.2", package = "onde-mistralrs-metal-compile" }
-mistralrs-flash-attn = { path = "mistralrs-flash-attn", version = "0.9.2", package = "onde-mistralrs-flash-attn" }
-mistralrs-quant = { path = "mistralrs-quant", version = "0.9.2", package = "onde-mistralrs-quant" }
-mistralrs-vision = { path = "mistralrs-vision", version = "0.9.2", package = "onde-mistralrs-vision" }
-mistralrs-server-core = { path = "mistralrs-server-core", version = "0.9.2" }
-mistralrs = { path = "mistralrs", version = "0.9.2", package = "onde-mistralrs" }
-mistralrs-audio = { path = "mistralrs-audio", version = "0.9.2", package = "onde-mistralrs-audio" }
-mistralrs-mcp = { path = "mistralrs-mcp", version = "0.9.2", package = "onde-mistralrs-mcp" }
-mistralrs-macros = { path = "mistralrs-macros", version = "0.9.2", package = "onde-mistralrs-macros" }
-mistralrs-code-exec = { path = "mistralrs-code-exec", version = "0.9.2", package = "onde-mistralrs-code-exec" }
-mistralrs-sandbox = { path = "mistralrs-sandbox", version = "0.9.2", package = "onde-mistralrs-sandbox" }
+mistralrs-core = { path = "mistralrs-core", version = "0.9.3", package = "onde-mistralrs-core" }
+mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.9.3", package = "onde-mistralrs-paged-attn" }
+mistralrs-metal-compile = { path = "mistralrs-metal-compile", version = "0.9.3", package = "onde-mistralrs-metal-compile" }
+mistralrs-flash-attn = { path = "mistralrs-flash-attn", version = "0.9.3", package = "onde-mistralrs-flash-attn" }
+mistralrs-quant = { path = "mistralrs-quant", version = "0.9.3", package = "onde-mistralrs-quant" }
+mistralrs-vision = { path = "mistralrs-vision", version = "0.9.3", package = "onde-mistralrs-vision" }
+mistralrs-server-core = { path = "mistralrs-server-core", version = "0.9.3" }
+mistralrs = { path = "mistralrs", version = "0.9.3", package = "onde-mistralrs" }
+mistralrs-audio = { path = "mistralrs-audio", version = "0.9.3", package = "onde-mistralrs-audio" }
+mistralrs-mcp = { path = "mistralrs-mcp", version = "0.9.3", package = "onde-mistralrs-mcp" }
+mistralrs-macros = { path = "mistralrs-macros", version = "0.9.3", package = "onde-mistralrs-macros" }
+mistralrs-code-exec = { path = "mistralrs-code-exec", version = "0.9.3", package = "onde-mistralrs-code-exec" }
+mistralrs-sandbox = { path = "mistralrs-sandbox", version = "0.9.3", package = "onde-mistralrs-sandbox" }
 
 # Use forked sysctl with watchOS (target_os = "watchos") support until upstream merges it.
 # Upstream PR: https://github.com/johalun/sysctl-rs/pull/XXX
 # Fork branch: https://github.com/setoelkahfi/sysctl-rs/tree/feature/watchos
-#
-# Workaround: core2 0.4.0 was yanked from crates.io but is still pulled in by
-# openai-harmony → image (default features) → ravif → rav1e → bitstream-io.
 [patch.crates-io]
 sysctl = { git = "https://github.com/setoelkahfi/sysctl-rs.git", branch = "feature/watchos" }
-core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bc" }
 
 [profile.release-with-debug]
 inherits = "release"
