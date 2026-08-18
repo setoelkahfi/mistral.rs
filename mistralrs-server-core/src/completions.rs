@@ -13,11 +13,16 @@ use crate::{
         BaseCompletionResponder,
     },
     handler_core::{
-        base_process_non_streaming_response, create_response_channel, send_request,
-        BaseJsonModelError, ErrorToResponse, JsonError, ModelErrorMessage,
+        apply_model_override, base_process_non_streaming_response, create_response_channel,
+        request_model_override, send_request_with_model, BaseJsonModelError, ErrorToResponse,
+        JsonError, ModelErrorMessage,
     },
-    openai::{CompletionRequest, Grammar},
-    streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
+    lora_adapters::resolve_lora_adapter_model,
+    openai::{CompletionChunkResponseBody, CompletionRequest, CompletionResponseBody, Grammar},
+    streaming::{
+        base_create_streamer, get_keep_alive_interval, observe_response, BaseStreamer, DoneState,
+        StreamOutcomeHandle,
+    },
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
     util::{sanitize_error_message, validate_model_name},
 };
@@ -29,6 +34,7 @@ use axum::{
         sse::{Event, KeepAlive, KeepAliveStream},
         IntoResponse, Sse,
     },
+    Extension,
 };
 use mistralrs_core::{
     CompletionChunkResponse, CompletionResponse, Constraint, MistralRs, NormalRequest, Request,
@@ -107,62 +113,65 @@ impl futures::Stream for CompletionStreamer {
         }
 
         match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(resp)) => match resp {
-                Response::CompletionModelError(msg, _) => {
-                    MistralRs::maybe_log_error(
-                        self.state.clone(),
-                        &ModelErrorMessage(msg.to_string()),
-                    );
-                    // Done now, just need to send the [DONE]
-                    self.done_state = DoneState::SendingDone;
-                    Poll::Ready(Some(Ok(Event::default().data(msg))))
-                }
-                Response::ValidationError(e) => {
-                    self.done_state = DoneState::SendingDone;
-                    Poll::Ready(Some(Ok(
-                        Event::default().data(sanitize_error_message(e.as_ref()))
-                    )))
-                }
-                Response::InternalError(e) => {
-                    MistralRs::maybe_log_error(self.state.clone(), &*e);
-                    self.done_state = DoneState::SendingDone;
-                    Poll::Ready(Some(Ok(
-                        Event::default().data(sanitize_error_message(e.as_ref()))
-                    )))
-                }
-                Response::CompletionChunk(mut response) => {
-                    if response.choices.iter().all(|x| x.finish_reason.is_some()) {
+            Poll::Ready(Some(resp)) => {
+                observe_response(&self.outcome, &resp);
+                match resp {
+                    Response::CompletionModelError(msg, _) => {
+                        MistralRs::maybe_log_error(
+                            self.state.clone(),
+                            &ModelErrorMessage(msg.to_string()),
+                        );
+                        // Done now, just need to send the [DONE]
                         self.done_state = DoneState::SendingDone;
+                        Poll::Ready(Some(Ok(Event::default().data(msg))))
                     }
-                    // Done now, just need to send the [DONE]
-                    MistralRs::maybe_log_response(self.state.clone(), &response);
-
-                    if let Some(on_chunk) = &self.on_chunk {
-                        response = on_chunk(response);
+                    Response::ValidationError(e) => {
+                        self.done_state = DoneState::SendingDone;
+                        Poll::Ready(Some(Ok(
+                            Event::default().data(sanitize_error_message(e.as_ref()))
+                        )))
                     }
-
-                    if self.store_chunks {
-                        self.chunks.push(response.clone());
+                    Response::InternalError(e) => {
+                        MistralRs::maybe_log_error(self.state.clone(), &*e);
+                        self.done_state = DoneState::SendingDone;
+                        Poll::Ready(Some(Ok(
+                            Event::default().data(sanitize_error_message(e.as_ref()))
+                        )))
                     }
+                    Response::CompletionChunk(mut response) => {
+                        if response.choices.iter().all(|x| x.finish_reason.is_some()) {
+                            self.done_state = DoneState::SendingDone;
+                        }
+                        // Done now, just need to send the [DONE]
+                        MistralRs::maybe_log_response(self.state.clone(), &response);
 
-                    Poll::Ready(Some(Event::default().json_data(response)))
+                        if let Some(on_chunk) = &self.on_chunk {
+                            response = on_chunk(response);
+                        }
+
+                        if self.store_chunks {
+                            self.chunks.push(response.clone());
+                        }
+
+                        Poll::Ready(Some(Event::default().json_data(response)))
+                    }
+                    Response::AgenticToolCallProgress { .. }
+                    | Response::BlockDenoisingProgress(_)
+                    | Response::AgenticToolApprovalRequired { .. }
+                    | Response::File(_) => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Response::Done(_) => unreachable!(),
+                    Response::CompletionDone(_) => unreachable!(),
+                    Response::Chunk(_) => unreachable!(),
+                    Response::ImageGeneration(_) => unreachable!(),
+                    Response::ModelError(_, _) => unreachable!(),
+                    Response::Speech { .. } => unreachable!(),
+                    Response::Raw { .. } => unreachable!(),
+                    Response::Embeddings { .. } => unreachable!(),
                 }
-                Response::AgenticToolCallProgress { .. }
-                | Response::BlockDenoisingProgress(_)
-                | Response::AgenticToolApprovalRequired { .. }
-                | Response::File(_) => {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-                Response::Done(_) => unreachable!(),
-                Response::CompletionDone(_) => unreachable!(),
-                Response::Chunk(_) => unreachable!(),
-                Response::ImageGeneration(_) => unreachable!(),
-                Response::ModelError(_, _) => unreachable!(),
-                Response::Speech { .. } => unreachable!(),
-                Response::Raw { .. } => unreachable!(),
-                Response::Embeddings { .. } => unreachable!(),
-            },
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
@@ -175,7 +184,6 @@ pub type CompletionResponder =
 
 /// JSON error response structure for model errors.
 type JsonModelError = BaseJsonModelError<CompletionResponse>;
-impl ErrorToResponse for JsonModelError {}
 
 impl IntoResponse for CompletionResponder {
     /// Converts the completion responder into an HTTP response.
@@ -246,6 +254,7 @@ pub fn parse_request(
                 repetition_penalty: oairequest.repetition_penalty,
                 max_len: oairequest.max_tokens,
                 stop_toks,
+                ignore_eos: oairequest.ignore_eos,
                 logits_bias: oairequest.logit_bias,
                 n_choices: oairequest.n_choices,
                 dry_params,
@@ -281,6 +290,7 @@ pub fn parse_request(
             } else {
                 Some(oairequest.model.clone())
             },
+            adapter: oairequest.adapter.map(Into::into),
             truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
             session_id: None,
             files: None,
@@ -296,27 +306,63 @@ pub fn parse_request(
     tag = "Mistral.rs",
     path = "/v1/completions",
     request_body = CompletionRequest,
-    responses((status = 200, description = "Completions"))
+    responses((
+        status = 200,
+        description = "Completion JSON or server-sent event chunks",
+        content(
+            (CompletionResponseBody = "application/json"),
+            (CompletionChunkResponseBody = "text/event-stream")
+        )
+    ))
 )]
 pub async fn completions(
     State(state): ExtractedMistralRsState,
-    Json(oairequest): Json<CompletionRequest>,
+    stream_outcome: Option<Extension<StreamOutcomeHandle>>,
+    Json(mut oairequest): Json<CompletionRequest>,
 ) -> CompletionResponder {
     let (tx, mut rx) = create_response_channel(None);
+    let requested_model = oairequest.model.clone();
+
+    if let Err(error) =
+        resolve_lora_adapter_model(&state, &mut oairequest.model, &mut oairequest.adapter)
+    {
+        return CompletionResponder::ValidationError(Box::new(JsonError::new(error)));
+    }
+    let model_override = request_model_override(requested_model, &oairequest.model);
+    let model_id = (oairequest.model != "default").then(|| oairequest.model.clone());
 
     let (request, is_streaming) = match parse_request(oairequest, state.clone(), tx) {
         Ok(x) => x,
         Err(e) => return handle_error(state, e.into()),
     };
 
-    if let Err(e) = send_request(&state, request).await {
+    if let Err(e) = send_request_with_model(&state, request, model_id.as_deref()).await {
+        if matches!(
+            &e,
+            mistralrs_core::MistralRsError::LoraAdapter(_)
+                | mistralrs_core::MistralRsError::ModelNotFound(_)
+        ) {
+            return CompletionResponder::ValidationError(Box::new(e));
+        }
         return handle_error(state, e.into());
     }
 
     if is_streaming {
-        CompletionResponder::Sse(create_streamer(rx, state, None, None))
+        let on_chunk = model_override.map(|model| {
+            Box::new(move |mut response: CompletionChunkResponse| {
+                apply_model_override(&mut response.model, Some(&model));
+                response
+            }) as CompletionOnChunkCallback
+        });
+        CompletionResponder::Sse(create_streamer_with_outcome(
+            rx,
+            state,
+            on_chunk,
+            None,
+            stream_outcome.map(|Extension(handle)| handle),
+        ))
     } else {
-        process_non_streaming_response(&mut rx, state).await
+        process_non_streaming_response_with_model(&mut rx, state, model_override.as_deref()).await
     }
 }
 
@@ -335,7 +381,18 @@ pub fn create_streamer(
     on_chunk: Option<CompletionOnChunkCallback>,
     on_done: Option<CompletionOnDoneCallback>,
 ) -> Sse<KeepAliveStream<CompletionStreamer>> {
-    let streamer = base_create_streamer(rx, state, on_chunk, on_done);
+    create_streamer_with_outcome(rx, state, on_chunk, on_done, None)
+}
+
+/// Like [`create_streamer`], also reporting usage and errors to the access log at stream end.
+pub fn create_streamer_with_outcome(
+    rx: Receiver<Response>,
+    state: SharedMistralRsState,
+    on_chunk: Option<CompletionOnChunkCallback>,
+    on_done: Option<CompletionOnDoneCallback>,
+    outcome: Option<StreamOutcomeHandle>,
+) -> Sse<KeepAliveStream<CompletionStreamer>> {
+    let streamer = base_create_streamer(rx, state, on_chunk, on_done, outcome);
     let keep_alive_interval = get_keep_alive_interval();
 
     Sse::new(streamer)
@@ -347,7 +404,30 @@ pub async fn process_non_streaming_response(
     rx: &mut Receiver<Response>,
     state: SharedMistralRsState,
 ) -> CompletionResponder {
-    base_process_non_streaming_response(rx, state, match_responses, handle_error).await
+    process_non_streaming_response_with_model(rx, state, None).await
+}
+
+async fn process_non_streaming_response_with_model(
+    rx: &mut Receiver<Response>,
+    state: SharedMistralRsState,
+    model_override: Option<&str>,
+) -> CompletionResponder {
+    base_process_non_streaming_response(
+        rx,
+        state,
+        |state, mut response| {
+            match &mut response {
+                Response::CompletionDone(response)
+                | Response::CompletionModelError(_, response) => {
+                    apply_model_override(&mut response.model, model_override);
+                }
+                _ => {}
+            }
+            match_responses(state, response)
+        },
+        handle_error,
+    )
+    .await
 }
 
 /// Matches and processes different types of model responses into appropriate completion responses.

@@ -5,7 +5,7 @@ use crate::{
     reasoning_parsers::{ReasoningMode, ReasoningParser},
     response::{ChatCompletionChunkResponse, Choice, ChunkChoice, Response, SYSTEM_FINGERPRINT},
     sampler::{Logprobs, Sampler},
-    AudioInput, ChatCompletionResponse, Usage, VideoInput,
+    AdapterGenerationId, AdapterLease, AudioInput, ChatCompletionResponse, Usage, VideoInput,
 };
 use crate::{
     pipeline::{DiffusionGenerationParams, KvCache},
@@ -33,6 +33,17 @@ pub type SeqPreallocatedCache = Vec<Option<(Tensor, Tensor)>>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ActiveMultimodalWindow {
     item_range: Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefillTokenView {
+    PrefixInclusive,
+    SuffixOnly,
+}
+
+struct PrefillTokens {
+    tokens: Vec<u32>,
+    view: PrefillTokenView,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -253,6 +264,13 @@ impl SequenceVideos {
             self.videos = self.videos[start..].to_vec();
         }
     }
+
+    fn keep_num_video_frames(&mut self, video_frames_to_keep: usize) {
+        let frame_count = self.videos.iter().map(|video| video.frames.len()).sum();
+        if frame_count > video_frames_to_keep {
+            self.videos = self.clone_frames_range(frame_count - video_frames_to_keep..frame_count);
+        }
+    }
 }
 
 // Holds all multimodal (vision/diffusion) data for a Sequence.
@@ -266,11 +284,9 @@ pub struct MultimodalData {
     pub cached_num_crops: Option<Vec<usize>>,
     pub cached_img_thw: Option<Tensor>,
     pub cached_vid_thw: Option<Tensor>,
-    /// Complete image grid THW covering ALL images in the sequence (including prefix-cached ones).
-    /// Used by Qwen VL models for MRoPE position computation in `get_rope_index`.
-    /// Unlike `cached_img_thw`, this is never cleared by `keep_num_images`.
+    /// Complete image grid metadata, including prefix-cached images.
     pub rope_img_grid_thw: Option<Tensor>,
-    /// Complete video grid THW covering ALL videos in the sequence (including prefix-cached ones).
+    /// Complete video grid metadata, including prefix-cached videos.
     pub rope_vid_grid_thw: Option<Tensor>,
     pub has_changed_prompt: bool,
     pub image_gen_response_format: Option<ImageGenerationResponseFormat>,
@@ -438,6 +454,12 @@ impl MultimodalData {
         }
     }
 
+    pub fn keep_num_video_frames(&mut self, video_frames_to_keep: usize) {
+        if let Some(vids) = self.input_videos.as_mut() {
+            vids.keep_num_video_frames(video_frames_to_keep)
+        }
+    }
+
     pub fn keep_num_images(&mut self, images_to_keep: usize) {
         if let Some(imgs) = self.input_images.as_mut() {
             imgs.keep_num_images(images_to_keep);
@@ -561,14 +583,19 @@ pub fn clamp_prefix_cache_len_for_mm_features(
         return prefix_len;
     }
 
-    for feature in features {
-        let end = feature.offset + feature.length;
-        if feature.offset < prefix_len && prefix_len < end {
-            return (feature.offset / block_size) * block_size;
+    let mut prefix_len = prefix_len;
+    loop {
+        let next = features
+            .iter()
+            .filter(|feature| feature.offset < prefix_len && prefix_len < feature.end())
+            .map(|feature| (feature.offset / block_size) * block_size)
+            .min()
+            .unwrap_or(prefix_len);
+        if next == prefix_len {
+            return prefix_len;
         }
+        prefix_len = next;
     }
-
-    prefix_len
 }
 
 #[derive(Default)]
@@ -647,6 +674,7 @@ pub struct Sequence {
     sampler: Arc<Sampler>,
     stop_tokens: Vec<u32>,
     stop_strings: Vec<String>,
+    ignore_eos: bool,
     return_logprobs: bool,
     responder: Sender<Response>,
     response_index: usize,
@@ -656,6 +684,7 @@ pub struct Sequence {
     pub(crate) return_raw_logits: bool,
     token_offset: usize,
     eos_tokens: Vec<u32>,
+    adapter: Option<AdapterLease>,
 
     // Multimodal data (images, diffusion settings, pixel caches)
     pub multimodal: MultimodalData,
@@ -669,10 +698,11 @@ pub struct Sequence {
     staged_speculative_logits: Option<Tensor>,
 
     // Prefix caching
-    prefill_prompt_toks: Option<Vec<u32>>,
+    prefill_prompt_toks: Option<PrefillTokens>,
     /// Number of tokens at the start of the prompt that are cached (KV already computed).
     /// These tokens should be skipped during prefill.
     prefix_cache_len: usize,
+    prefix_cache_hit_recorded: bool,
     block_hash_revision: u64,
     /// Number of logical tokens represented in model/cache state.
     num_computed_tokens: usize,
@@ -765,6 +795,7 @@ impl Sequence {
         seq_preallocated_cache: Option<SeqPreallocatedCache>,
         //
         return_raw_logits: bool,
+        ignore_eos: bool,
         eos_tokens: Vec<u32>,
     ) -> Self {
         let prompt_len = tokens.len();
@@ -792,6 +823,7 @@ impl Sequence {
             sampler: sampler.into(),
             stop_tokens,
             stop_strings,
+            ignore_eos,
             max_len,
             return_logprobs,
             prompt_tok_per_sec: 0.,
@@ -803,6 +835,7 @@ impl Sequence {
             recognizer,
             prefill_prompt_toks: None,
             prefix_cache_len: 0,
+            prefix_cache_hit_recorded: false,
             block_hash_revision: 0,
             num_computed_tokens: 0,
             pending_denoise_time_ms: 0,
@@ -831,6 +864,7 @@ impl Sequence {
             return_raw_logits,
             token_offset: 0,
             eos_tokens,
+            adapter: None,
             total_prompt_time: None,
             total_completion_time: None,
             step_start_instant: None,
@@ -865,7 +899,10 @@ impl Sequence {
         offset: usize,
     ) -> Self {
         self.normal_cache = cache;
-        self.prefill_prompt_toks = Some(toks);
+        self.prefill_prompt_toks = Some(PrefillTokens {
+            tokens: toks,
+            view: PrefillTokenView::SuffixOnly,
+        });
         self.set_state(SequenceState::RunningPrefillPrompt);
         self.token_offset = offset;
         self.prefix_cache_len = offset;
@@ -874,8 +911,8 @@ impl Sequence {
 
     /// This is the number of tokens. If the KV cache is Some, then it will use that.
     pub fn len(&self) -> usize {
-        if let Some(toks) = &self.prefill_prompt_toks {
-            return toks.len();
+        if let Some(prefill) = &self.prefill_prompt_toks {
+            return prefill.tokens.len();
         }
         // Use xlora cache first because of non granular
         if self.xlora_cache.as_ref().is_some_and(|c| c[0].is_some()) {
@@ -906,6 +943,20 @@ impl Sequence {
 
     pub fn id(&self) -> &usize {
         &self.id
+    }
+
+    pub(crate) fn bind_adapter(&mut self, adapter: AdapterLease) {
+        assert!(self.adapter.is_none(), "sequence adapter is already bound");
+        self.adapter = Some(adapter);
+        self.block_hash_revision = self.block_hash_revision.wrapping_add(1);
+    }
+
+    pub(crate) fn adapter_lease(&self) -> Option<&AdapterLease> {
+        self.adapter.as_ref()
+    }
+
+    pub fn adapter_generation(&self) -> Option<AdapterGenerationId> {
+        self.adapter.as_ref().map(AdapterLease::generation)
     }
 
     pub fn is_running(&self) -> bool {
@@ -944,8 +995,8 @@ impl Sequence {
     }
 
     pub fn get_toks(&self) -> &[u32] {
-        if let Some(toks) = &self.prefill_prompt_toks {
-            return toks;
+        if let Some(prefill) = &self.prefill_prompt_toks {
+            return &prefill.tokens;
         }
         &self.tokens
     }
@@ -954,14 +1005,78 @@ impl Sequence {
         self.prefill_prompt_toks.is_some() && !self.mm_features().is_empty()
     }
 
+    fn prefill_token_view(&self) -> Option<PrefillTokenView> {
+        self.prefill_prompt_toks
+            .as_ref()
+            .map(|prefill| prefill.view)
+    }
+
+    pub(crate) fn has_suffix_only_prefill_toks(&self) -> bool {
+        self.prefill_token_view() == Some(PrefillTokenView::SuffixOnly)
+    }
+
+    pub(crate) fn active_prompt_query_range(&self) -> Option<Range<usize>> {
+        let view = self.prefill_token_view()?;
+        let prefix_len = self.prefix_cache_len();
+        let token_len = self.get_toks().len();
+        Some(match view {
+            PrefillTokenView::PrefixInclusive => prefix_len.min(token_len)..token_len,
+            PrefillTokenView::SuffixOnly => prefix_len..prefix_len.saturating_add(token_len),
+        })
+    }
+
+    pub(crate) fn active_prompt_local_query_range(&self) -> Option<Range<usize>> {
+        let view = self.prefill_token_view()?;
+        let prefix_len = self.prefix_cache_len();
+        let token_len = self.get_toks().len();
+        Some(match view {
+            PrefillTokenView::PrefixInclusive => prefix_len.min(token_len)..token_len,
+            PrefillTokenView::SuffixOnly => 0..token_len,
+        })
+    }
+
+    pub(crate) fn prompt_position_source_toks(&self) -> &[u32] {
+        match self.prefill_token_view() {
+            Some(PrefillTokenView::SuffixOnly) => &self.tokens,
+            _ => self.get_toks(),
+        }
+    }
+
+    pub(crate) fn active_multimodal_item_range(
+        &self,
+        kind: MultimodalKind,
+    ) -> Option<Range<usize>> {
+        self.active_multimodal_window(kind)
+            .map(|window| window.item_range)
+    }
+
+    pub(crate) fn active_local_multimodal_item_range(
+        &self,
+        kind: MultimodalKind,
+        available_items: usize,
+    ) -> Option<Range<usize>> {
+        let range = self.active_multimodal_item_range(kind)?;
+        if self.prefill_token_view()? == PrefillTokenView::PrefixInclusive {
+            return (range.end <= available_items).then_some(range);
+        }
+        let total_items = self
+            .mm_features()
+            .iter()
+            .filter(|feature| feature.kind == kind)
+            .map(|feature| feature.item_range.end)
+            .max()
+            .unwrap_or(0);
+        let retained_start = total_items.saturating_sub(available_items);
+        (retained_start <= range.start && range.end <= total_items)
+            .then(|| range.start - retained_start..range.end - retained_start)
+    }
+
     fn active_multimodal_window(&self, kind: MultimodalKind) -> Option<ActiveMultimodalWindow> {
-        self.prefill_prompt_toks.as_ref()?;
         if self.mm_features().is_empty() {
             return None;
         }
 
-        let end = self.get_toks().len();
-        let start = self.prefix_cache_len().min(end);
+        let query = self.active_prompt_query_range()?;
         let mut first = None;
         let mut last = None;
         for feature in self
@@ -969,7 +1084,7 @@ impl Sequence {
             .iter()
             .filter(|feature| feature.kind == kind)
         {
-            if feature.overlaps(start, end) {
+            if feature.overlaps(query.start, query.end) {
                 first = Some(first.map_or(feature.item_range.start, |idx: usize| {
                     idx.min(feature.item_range.start)
                 }));
@@ -1034,6 +1149,16 @@ impl Sequence {
         self.prefix_cache_len = len;
     }
 
+    pub(crate) fn record_prefix_cache_hit(&mut self) -> bool {
+        if !matches!(self.sequence_stepping_type, SeqStepType::PromptAndDecode)
+            || self.prefix_cache_hit_recorded
+        {
+            return false;
+        }
+        self.prefix_cache_hit_recorded = true;
+        true
+    }
+
     pub fn clip_prefix_cache_len_for_non_causal_mm_features(&mut self, block_size: usize) {
         if block_size == 0 || self.prefix_cache_len == 0 {
             return;
@@ -1046,6 +1171,32 @@ impl Sequence {
             {
                 prefix_len = prefix_len.min((feature.offset / block_size) * block_size);
             }
+        }
+        self.prefix_cache_len = prefix_len;
+    }
+
+    pub fn clip_prefix_cache_len_for_mm_features(&mut self, block_size: usize) {
+        if block_size == 0 || self.prefix_cache_len == 0 {
+            return;
+        }
+        let mut prefix_len = self.prefix_cache_len;
+        loop {
+            let next = self
+                .mm_features()
+                .iter()
+                .filter(|feature| {
+                    (!feature.splittable
+                        || feature.attention_policy == MultimodalAttentionPolicy::NonCausal)
+                        && feature.offset < prefix_len
+                        && prefix_len < feature.end()
+                })
+                .map(|feature| (feature.offset / block_size) * block_size)
+                .min()
+                .unwrap_or(prefix_len);
+            if next == prefix_len {
+                break;
+            }
+            prefix_len = next;
         }
         self.prefix_cache_len = prefix_len;
     }
@@ -1170,7 +1321,14 @@ impl Sequence {
 
     /// Add a some prefill tokens. Only meant for internal speculative decoding usage.
     pub fn set_prefill_toks(&mut self, toks: Vec<u32>) {
-        self.prefill_prompt_toks = Some(toks)
+        if let Some(prefill) = self.prefill_prompt_toks.as_mut() {
+            prefill.tokens = toks;
+        } else {
+            self.prefill_prompt_toks = Some(PrefillTokens {
+                tokens: toks,
+                view: PrefillTokenView::PrefixInclusive,
+            });
+        }
     }
 
     pub fn has_prefill_toks(&self) -> bool {
@@ -1248,10 +1406,11 @@ impl Sequence {
             .tool_call_state
             .as_ref()
             .is_some_and(|state| state.required_tool_call_unsatisfied());
-        let is_eos = match eos_tok {
-            Some(eos_tok) => eos_tok.contains(&tok),
-            None => false,
-        };
+        let is_eos = !self.ignore_eos
+            && match eos_tok {
+                Some(eos_tok) => eos_tok.contains(&tok),
+                None => false,
+            };
         if is_eos && !required_tool_call_unsatisfied {
             Some(StopReason::Eos)
         } else if matches!(
@@ -1292,6 +1451,11 @@ impl Sequence {
         self.return_logprobs
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) fn sampling_logprob_required(&self) -> bool {
+        get_mut_group!(self).sampling_logprob_required()
+    }
+
     pub fn prompt_tokens(&self) -> usize {
         self.prompt_len
     }
@@ -1304,29 +1468,60 @@ impl Sequence {
     pub fn get_delta(
         &mut self,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let new_decoded = self.peek_delta();
-        if matches!(new_decoded, Ok(Some(_))) {
-            self.stream_idx = self.completion_bytes.len();
+        let (new_decoded, consumed) = self.decode_streamable_delta();
+        if new_decoded.is_some() {
+            self.stream_idx += consumed;
         }
-        new_decoded
+        Ok(new_decoded)
+    }
+
+    pub fn get_final_delta(&mut self) -> String {
+        let is_first = self.stream_idx == 0;
+        let decoded = String::from_utf8_lossy(&self.completion_bytes[self.stream_idx..]);
+        self.stream_idx = self.completion_bytes.len();
+        if is_first {
+            decoded.trim_start().to_string()
+        } else {
+            decoded.to_string()
+        }
     }
 
     /// Peeks at the delta between the last two decoded sequences, but does not advance the stream index.
     pub fn peek_delta(&self) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.decode_streamable_delta().0)
+    }
+
+    fn decode_streamable_delta(&self) -> (Option<String>, usize) {
         let is_first = self.stream_idx == 0;
-        let new_decoded = String::from_utf8_lossy(&self.completion_bytes[self.stream_idx..]);
-        // Check if the sequence ends with valid utf8, if not skip it as it probably is a multi token sequence
-        if new_decoded.ends_with('�') {
-            return Ok(None);
+        let pending = &self.completion_bytes[self.stream_idx..];
+        let mut consumed = 0;
+        while consumed < pending.len() {
+            match std::str::from_utf8(&pending[consumed..]) {
+                Ok(_) => {
+                    consumed = pending.len();
+                    break;
+                }
+                Err(error) => {
+                    consumed += error.valid_up_to();
+                    let Some(invalid_len) = error.error_len() else {
+                        break;
+                    };
+                    consumed += invalid_len;
+                }
+            }
         }
+        if consumed == 0 {
+            return (None, 0);
+        }
+        let new_decoded = String::from_utf8_lossy(&pending[..consumed]);
 
         // The first token usually starts with a space. We don't want to add that to the delta.
         // Since we're using the completion_bytes, we need to take care of that ourselves.
         // Had we used HF's Tokenizer, it would have taken care of that for us.
         if is_first {
-            return Ok(Some(new_decoded.trim_start().to_string()));
+            return (Some(new_decoded.trim_start().to_string()), consumed);
         }
-        Ok(Some(new_decoded.to_string()))
+        (Some(new_decoded.to_string()), consumed)
     }
 
     pub fn timestamp(&self) -> u128 {
@@ -1471,8 +1666,11 @@ impl Sequence {
     }
 
     pub fn take_images(&mut self) -> Option<Vec<image::DynamicImage>> {
-        if let Some(window) = self.active_multimodal_window(MultimodalKind::Image) {
-            return self.multimodal.clone_images_range(window.item_range);
+        if self.is_chunked_prefill_view() {
+            let available_items = self.multimodal.images().map_or(0, <[_]>::len);
+            return self
+                .active_local_multimodal_item_range(MultimodalKind::Image, available_items)
+                .and_then(|range| self.multimodal.clone_images_range(range));
         }
         self.multimodal.take_images()
     }
@@ -1489,6 +1687,8 @@ impl Sequence {
         self.multimodal.image_hashes().map(|hashes| {
             if let Some(window) = self.active_multimodal_window(MultimodalKind::Image) {
                 &hashes[window.item_range]
+            } else if self.is_chunked_prefill_view() {
+                &hashes[0..0]
             } else {
                 hashes
             }
@@ -1496,17 +1696,21 @@ impl Sequence {
     }
 
     pub fn has_images(&self) -> bool {
-        if self.prefill_prompt_toks.is_some() && !self.mm_features().is_empty() {
+        if self.is_chunked_prefill_view() {
+            let available_items = self.multimodal.images().map_or(0, <[_]>::len);
             return self
-                .active_multimodal_window(MultimodalKind::Image)
+                .active_local_multimodal_item_range(MultimodalKind::Image, available_items)
                 .is_some();
         }
         self.multimodal.has_images()
     }
 
     pub fn take_audios(&mut self) -> Option<Vec<AudioInput>> {
-        if let Some(window) = self.active_multimodal_window(MultimodalKind::Audio) {
-            return self.multimodal.clone_audios_range(window.item_range);
+        if self.is_chunked_prefill_view() {
+            let available_items = self.multimodal.audios().map_or(0, <[_]>::len);
+            return self
+                .active_local_multimodal_item_range(MultimodalKind::Audio, available_items)
+                .and_then(|range| self.multimodal.clone_audios_range(range));
         }
         self.multimodal.take_audios()
     }
@@ -1523,6 +1727,8 @@ impl Sequence {
         self.multimodal.audio_hashes().map(|hashes| {
             if let Some(window) = self.active_multimodal_window(MultimodalKind::Audio) {
                 &hashes[window.item_range]
+            } else if self.is_chunked_prefill_view() {
+                &hashes[0..0]
             } else {
                 hashes
             }
@@ -1530,9 +1736,10 @@ impl Sequence {
     }
 
     pub fn has_audios(&self) -> bool {
-        if self.prefill_prompt_toks.is_some() && !self.mm_features().is_empty() {
+        if self.is_chunked_prefill_view() {
+            let available_items = self.multimodal.audios().map_or(0, <[_]>::len);
             return self
-                .active_multimodal_window(MultimodalKind::Audio)
+                .active_local_multimodal_item_range(MultimodalKind::Audio, available_items)
                 .is_some();
         }
         self.multimodal.has_audios()
@@ -1544,8 +1751,13 @@ impl Sequence {
     }
 
     pub fn take_videos(&mut self) -> Option<Vec<VideoInput>> {
-        if let Some(window) = self.active_multimodal_window(MultimodalKind::Video) {
-            return self.multimodal.clone_frames_range(window.item_range);
+        if self.is_chunked_prefill_view() {
+            let available_items = self.multimodal.videos().map_or(0, |videos| {
+                videos.iter().map(|video| video.frames.len()).sum()
+            });
+            return self
+                .active_local_multimodal_item_range(MultimodalKind::Video, available_items)
+                .and_then(|range| self.multimodal.clone_frames_range(range));
         }
         self.multimodal.take_videos()
     }
@@ -1562,6 +1774,8 @@ impl Sequence {
         self.multimodal.video_hashes().map(|hashes| {
             if let Some(window) = self.active_multimodal_window(MultimodalKind::Video) {
                 &hashes[window.item_range]
+            } else if self.is_chunked_prefill_view() {
+                &hashes[0..0]
             } else {
                 hashes
             }
@@ -1569,9 +1783,12 @@ impl Sequence {
     }
 
     pub fn has_videos(&self) -> bool {
-        if self.prefill_prompt_toks.is_some() && !self.mm_features().is_empty() {
+        if self.is_chunked_prefill_view() {
+            let available_items = self.multimodal.videos().map_or(0, |videos| {
+                videos.iter().map(|video| video.frames.len()).sum()
+            });
             return self
-                .active_multimodal_window(MultimodalKind::Video)
+                .active_local_multimodal_item_range(MultimodalKind::Video, available_items)
                 .is_some();
         }
         self.multimodal.has_videos()
@@ -1579,6 +1796,10 @@ impl Sequence {
 
     pub fn keep_num_videos(&mut self, videos_to_keep: usize) {
         self.multimodal.keep_num_videos(videos_to_keep)
+    }
+
+    pub fn keep_num_video_frames(&mut self, video_frames_to_keep: usize) {
+        self.multimodal.keep_num_video_frames(video_frames_to_keep)
     }
 
     /// Keep these last n images
@@ -1610,6 +1831,9 @@ impl Sequence {
     /// within the prefix cache. Used by multimodal model inputs_processors to trim
     /// pixel_values so they match only the non-cached image placeholder positions.
     pub fn count_prefix_cached_mm_items(&self) -> usize {
+        if self.is_chunked_prefill_view() {
+            return 0;
+        }
         let prefix_len = self.prefix_cache_len();
         if prefix_len == 0 {
             return 0;
@@ -1621,6 +1845,9 @@ impl Sequence {
     }
 
     pub fn count_prefix_cached_mm_items_by_kind(&self, kind: MultimodalKind) -> usize {
+        if self.is_chunked_prefill_view() {
+            return 0;
+        }
         let prefix_len = self.prefix_cache_len();
         if prefix_len == 0 {
             return 0;
@@ -1642,6 +1869,14 @@ impl Sequence {
 
     pub fn eos_tokens(&self) -> &[u32] {
         &self.eos_tokens
+    }
+
+    pub(crate) fn effective_eos_tokens<'a>(
+        &self,
+        eos_tokens: &'a [u32],
+        disable_eos_stop: bool,
+    ) -> Option<&'a [u32]> {
+        (!disable_eos_stop && !self.ignore_eos).then_some(eos_tokens)
     }
 
     /// Get the active reasoning mode, if any.
@@ -1769,6 +2004,11 @@ impl SequenceGroup {
 
     pub fn get_choices(&self) -> &[Choice] {
         &self.choices
+    }
+
+    #[cfg(feature = "cuda")]
+    fn sampling_logprob_required(&self) -> bool {
+        self.n_choices > 1 || self.best_of.is_some()
     }
 
     /// This may apply the best_of.
@@ -1925,6 +2165,9 @@ impl SequenceGroup {
                     system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
                     object: "chat.completion.chunk".to_string(),
                     usage: usage_opt,
+                    adapter_generation: seq
+                        .adapter_generation()
+                        .map(|generation| generation.to_string()),
                     session_id: None,
                 }))
                 .await?;
@@ -1944,6 +2187,9 @@ impl SequenceGroup {
                     model: model.clone(),
                     system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
                     object: "text_completion".to_string(),
+                    adapter_generation: seq
+                        .adapter_generation()
+                        .map(|generation| generation.to_string()),
                 }))
                 .await?;
         }
@@ -2019,8 +2265,71 @@ mod tests {
             None,
             None,
             false,
+            false,
             vec![],
         )
+    }
+
+    fn add_test_media(seq: &mut Sequence) {
+        seq.multimodal = MultimodalData::new(
+            Some(vec![image::DynamicImage::new_rgb8(1, 1)]),
+            Some(vec![AudioInput {
+                samples: vec![0.0],
+                sample_rate: 16_000,
+                channels: 1,
+            }]),
+            Some(vec![VideoInput::from_frames(
+                vec![image::DynamicImage::new_rgb8(1, 1)],
+                24.0,
+                None,
+            )]),
+            None,
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn ignore_eos_preserves_explicit_stops_and_length_limit() {
+        let eos_tokens = [42];
+        let mut seq = make_test_sequence();
+        seq.ignore_eos = true;
+
+        assert_eq!(seq.effective_eos_tokens(&eos_tokens, false), None);
+        assert_eq!(seq.is_done(42, Some(&eos_tokens), 1024), None);
+
+        seq.stop_tokens.push(42);
+        assert_eq!(
+            seq.is_done(42, Some(&eos_tokens), 1024),
+            Some(StopReason::StopTok(42))
+        );
+
+        seq.stop_tokens.clear();
+        seq.stop_strings.push("done".to_string());
+        seq.completion_bytes.extend_from_slice(b"done");
+        assert!(matches!(
+            seq.is_done(7, Some(&eos_tokens), 1024),
+            Some(StopReason::StopString { .. })
+        ));
+
+        seq.stop_strings.clear();
+        seq.max_len = Some(1);
+        assert_eq!(
+            seq.is_done(7, Some(&eos_tokens), 1024),
+            Some(StopReason::Length(1))
+        );
+    }
+
+    #[test]
+    fn engine_eos_override_applies_to_default_sequence() {
+        let eos_tokens = [42];
+        let seq = make_test_sequence();
+
+        assert_eq!(
+            seq.effective_eos_tokens(&eos_tokens, false),
+            Some(eos_tokens.as_slice())
+        );
+        assert_eq!(seq.effective_eos_tokens(&eos_tokens, true), None);
     }
 
     fn weather_tool() -> Tool {
@@ -2062,6 +2371,58 @@ mod tests {
     }
 
     #[test]
+    fn final_delta_flushes_incomplete_utf8() {
+        let mut seq = make_test_sequence();
+        seq.completion_bytes = vec![b'a', 0xe2, 0x82];
+
+        assert_eq!(seq.get_delta().unwrap(), Some("a".to_string()));
+        assert_eq!(seq.stream_idx, 1);
+        assert_eq!(seq.get_final_delta(), "\u{fffd}");
+        assert_eq!(seq.stream_idx, seq.completion_bytes.len());
+    }
+
+    #[test]
+    fn replacement_character_is_not_buffered() {
+        let mut seq = make_test_sequence();
+        seq.completion_bytes = "\u{fffd}".as_bytes().to_vec();
+
+        assert_eq!(seq.get_delta().unwrap(), Some("\u{fffd}".to_string()));
+        assert_eq!(seq.stream_idx, seq.completion_bytes.len());
+    }
+
+    #[test]
+    fn invalid_bytes_do_not_consume_a_trailing_incomplete_character() {
+        let mut seq = make_test_sequence();
+        seq.completion_bytes = vec![0xff, 0xe2];
+
+        assert_eq!(seq.get_delta().unwrap(), Some("\u{fffd}".to_string()));
+        assert_eq!(seq.stream_idx, 1);
+
+        seq.completion_bytes.extend([0x82, 0xac]);
+        assert_eq!(seq.get_delta().unwrap(), Some("\u{20ac}".to_string()));
+        assert_eq!(seq.stream_idx, seq.completion_bytes.len());
+    }
+
+    #[test]
+    fn prefix_cache_hit_is_recorded_once_for_generation_sequences() {
+        let mut seq = make_test_sequence();
+        assert!(seq.record_prefix_cache_hit());
+        assert!(!seq.record_prefix_cache_hit());
+
+        seq.sequence_stepping_type = SeqStepType::OneShot;
+        seq.prefix_cache_hit_recorded = false;
+        assert!(!seq.record_prefix_cache_hit());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn sampling_logprob_is_retained_for_multi_choice_groups() {
+        assert!(!SequenceGroup::new(1, false, true, None).sampling_logprob_required());
+        assert!(SequenceGroup::new(2, false, true, None).sampling_logprob_required());
+        assert!(SequenceGroup::new(1, false, false, Some(1)).sampling_logprob_required());
+    }
+
+    #[test]
     fn required_tool_call_forces_immediately_when_max_tokens_is_below_deadline() {
         let mut seq = make_test_sequence();
         add_required_tool(&mut seq);
@@ -2082,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_v2_normal_sets_prefix_cache_len_for_multimodal_trimming() {
+    fn chunk_media_view_does_not_double_count_prefix_items() {
         let mut seq = make_test_sequence();
         seq.set_mm_features(vec![
             MultiModalFeature {
@@ -2119,11 +2480,33 @@ mod tests {
         assert_eq!(seq.prefix_cache_len(), 4);
         assert_eq!(
             seq.count_prefix_cached_mm_items_by_kind(MultimodalKind::Image),
-            1
+            0
         );
         assert_eq!(
             seq.count_prefix_cached_mm_items_by_kind(MultimodalKind::Audio),
             0
+        );
+        assert_eq!(seq.count_prefix_cached_mm_items(), 0);
+    }
+
+    #[test]
+    fn non_chunk_media_view_counts_prefix_items() {
+        let mut seq = make_test_sequence();
+        seq.set_mm_features(vec![MultiModalFeature {
+            kind: MultimodalKind::Image,
+            item_range: 0..1,
+            hashes: vec![123],
+            offset: 0,
+            length: 3,
+            attention_policy: MultimodalAttentionPolicy::Causal,
+            splittable: false,
+        }]);
+        seq.set_prefix_cache_len(4);
+
+        assert_eq!(seq.count_prefix_cached_mm_items(), 1);
+        assert_eq!(
+            seq.count_prefix_cached_mm_items_by_kind(MultimodalKind::Image),
+            1
         );
     }
 
@@ -2160,5 +2543,391 @@ mod tests {
             clamp_prefix_cache_len_for_mm_features(64, 32, &features),
             64
         );
+    }
+
+    #[test]
+    fn multimodal_prefix_cache_len_clamps_to_a_fixed_point() {
+        let features = vec![
+            MultiModalFeature {
+                kind: MultimodalKind::Image,
+                item_range: 0..1,
+                hashes: vec![1],
+                offset: 16,
+                length: 24,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Image,
+                item_range: 1..2,
+                hashes: vec![2],
+                offset: 40,
+                length: 20,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+        ];
+
+        assert_eq!(
+            clamp_prefix_cache_len_for_mm_features(50, 16, &features),
+            16
+        );
+    }
+
+    #[test]
+    fn unsplittable_causal_feature_clips_sequence_prefix_cache() {
+        let mut seq = make_test_sequence();
+        seq.set_mm_features(vec![MultiModalFeature {
+            kind: MultimodalKind::Image,
+            item_range: 0..1,
+            hashes: vec![123],
+            offset: 31,
+            length: 4,
+            attention_policy: MultimodalAttentionPolicy::Causal,
+            splittable: false,
+        }]);
+        seq.set_prefix_cache_len(32);
+
+        seq.clip_prefix_cache_len_for_mm_features(32);
+
+        assert_eq!(seq.prefix_cache_len(), 0);
+    }
+
+    #[test]
+    fn noncausal_prefix_clipping_keeps_its_original_scope() {
+        let mut seq = make_test_sequence();
+        seq.set_mm_features(vec![MultiModalFeature {
+            kind: MultimodalKind::Image,
+            item_range: 0..1,
+            hashes: vec![123],
+            offset: 31,
+            length: 4,
+            attention_policy: MultimodalAttentionPolicy::Causal,
+            splittable: false,
+        }]);
+        seq.set_prefix_cache_len(32);
+
+        seq.clip_prefix_cache_len_for_non_causal_mm_features(32);
+
+        assert_eq!(seq.prefix_cache_len(), 32);
+    }
+
+    #[test]
+    fn prefix_clipping_reaches_a_fixed_point_across_adjacent_features() {
+        let mut seq = make_test_sequence();
+        seq.set_mm_features(vec![
+            MultiModalFeature {
+                kind: MultimodalKind::Image,
+                item_range: 0..1,
+                hashes: vec![1],
+                offset: 16,
+                length: 24,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Image,
+                item_range: 1..2,
+                hashes: vec![2],
+                offset: 40,
+                length: 20,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+        ]);
+        seq.set_prefix_cache_len(50);
+
+        seq.clip_prefix_cache_len_for_mm_features(16);
+
+        assert_eq!(seq.prefix_cache_len(), 16);
+    }
+
+    #[test]
+    fn chunk_media_accessors_expose_only_the_active_kind() {
+        let mut seq = make_test_sequence();
+        add_test_media(&mut seq);
+        seq.set_mm_features(vec![
+            MultiModalFeature {
+                kind: MultimodalKind::Image,
+                item_range: 0..1,
+                hashes: vec![1],
+                offset: 0,
+                length: 2,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Audio,
+                item_range: 0..1,
+                hashes: vec![2],
+                offset: 4,
+                length: 1,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Video,
+                item_range: 0..1,
+                hashes: vec![3],
+                offset: 6,
+                length: 1,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+        ]);
+        seq.set_prefix_cache_len(4);
+        seq.set_prefill_toks(vec![1, 2, 3, 4, 5]);
+
+        assert!(!seq.has_images());
+        assert!(seq.image_hashes().unwrap().is_empty());
+        assert!(seq.take_images().is_none());
+        assert!(seq.has_audios());
+        assert_eq!(seq.audio_hashes().unwrap().len(), 1);
+        assert_eq!(seq.take_audios().unwrap().len(), 1);
+        assert!(!seq.has_videos());
+        assert!(seq.video_hashes().unwrap().is_empty());
+        assert!(seq.take_videos().is_none());
+    }
+
+    #[test]
+    fn chunk_media_accessors_use_active_local_item_offsets() {
+        let mut seq = make_test_sequence();
+        seq.multimodal = MultimodalData::new(
+            Some(vec![
+                image::DynamicImage::new_rgb8(1, 1),
+                image::DynamicImage::new_rgb8(2, 1),
+            ]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        seq.set_mm_features(vec![
+            MultiModalFeature {
+                kind: MultimodalKind::Image,
+                item_range: 0..1,
+                hashes: vec![1],
+                offset: 0,
+                length: 2,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Image,
+                item_range: 1..2,
+                hashes: vec![2],
+                offset: 4,
+                length: 2,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+        ]);
+        seq.set_prefix_cache_len(4);
+        seq.set_prefill_toks(vec![1, 2, 3, 4, 5, 6]);
+
+        assert_eq!(seq.active_prompt_query_range(), Some(4..6));
+        assert_eq!(seq.active_prompt_local_query_range(), Some(4..6));
+        assert_eq!(seq.prompt_position_source_toks(), &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            seq.active_multimodal_item_range(MultimodalKind::Image),
+            Some(1..2)
+        );
+        assert_eq!(
+            seq.active_local_multimodal_item_range(MultimodalKind::Image, 2),
+            Some(1..2)
+        );
+        assert_eq!(seq.image_hashes().unwrap().len(), 1);
+        assert_eq!(seq.take_images().unwrap()[0].width(), 2);
+        assert_eq!(seq.count_prefix_cached_mm_items(), 0);
+    }
+
+    #[test]
+    fn suffix_only_prefill_view_survives_scheduler_state_transition() {
+        let mut seq = make_test_sequence();
+        seq.multimodal = MultimodalData::new(
+            Some(vec![
+                image::DynamicImage::new_rgb8(1, 1),
+                image::DynamicImage::new_rgb8(2, 1),
+            ]),
+            Some(vec![
+                AudioInput {
+                    samples: vec![1.0],
+                    sample_rate: 16_000,
+                    channels: 1,
+                },
+                AudioInput {
+                    samples: vec![2.0],
+                    sample_rate: 16_000,
+                    channels: 1,
+                },
+            ]),
+            Some(vec![
+                VideoInput::from_frames(vec![image::DynamicImage::new_rgb8(1, 1)], 24.0, None),
+                VideoInput::from_frames(vec![image::DynamicImage::new_rgb8(2, 1)], 24.0, None),
+            ]),
+            None,
+            None,
+            None,
+        );
+        seq.set_mm_features(vec![
+            MultiModalFeature {
+                kind: MultimodalKind::Image,
+                item_range: 0..1,
+                hashes: vec![1],
+                offset: 0,
+                length: 1,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Audio,
+                item_range: 0..1,
+                hashes: vec![2],
+                offset: 1,
+                length: 1,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Video,
+                item_range: 0..1,
+                hashes: vec![3],
+                offset: 2,
+                length: 1,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Image,
+                item_range: 1..2,
+                hashes: vec![4],
+                offset: 3,
+                length: 1,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Audio,
+                item_range: 1..2,
+                hashes: vec![5],
+                offset: 4,
+                length: 1,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+            MultiModalFeature {
+                kind: MultimodalKind::Video,
+                item_range: 1..2,
+                hashes: vec![6],
+                offset: 5,
+                length: 1,
+                attention_policy: MultimodalAttentionPolicy::Causal,
+                splittable: false,
+            },
+        ]);
+        seq.keep_num_images(1);
+        seq.keep_num_audios(1);
+        seq.keep_num_video_frames(1);
+        let mut seq = seq.prefill_v2_normal(vec![], vec![4, 5, 6], 3);
+        seq.set_state(SequenceState::Waiting);
+        seq.set_state(SequenceState::RunningPrompt);
+
+        assert!(seq.has_suffix_only_prefill_toks());
+        assert_eq!(seq.active_prompt_query_range(), Some(3..6));
+        assert_eq!(seq.active_prompt_local_query_range(), Some(0..3));
+        assert_eq!(seq.prompt_position_source_toks(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            seq.active_multimodal_item_range(MultimodalKind::Image),
+            Some(1..2)
+        );
+        assert_eq!(
+            seq.active_local_multimodal_item_range(MultimodalKind::Image, 1),
+            Some(0..1)
+        );
+        assert_eq!(seq.image_hashes().unwrap().len(), 1);
+        assert_eq!(seq.audio_hashes().unwrap().len(), 1);
+        assert_eq!(seq.video_hashes().unwrap().len(), 1);
+        assert_eq!(seq.take_images().unwrap()[0].width(), 2);
+        assert_eq!(seq.take_audios().unwrap()[0].samples, vec![2.0]);
+        assert_eq!(seq.take_videos().unwrap()[0].frames[0].width(), 2);
+        assert_eq!(seq.count_prefix_cached_mm_items(), 0);
+
+        seq.reset_prefill_toks();
+        assert!(!seq.has_suffix_only_prefill_toks());
+        assert_eq!(seq.active_prompt_query_range(), None);
+        assert!(!seq.is_chunked_prefill_view());
+    }
+
+    #[test]
+    fn video_prefix_retention_uses_frame_counts() {
+        let mut seq = make_test_sequence();
+        seq.multimodal = MultimodalData::new(
+            None,
+            None,
+            Some(vec![VideoInput::from_frames(
+                vec![
+                    image::DynamicImage::new_rgb8(1, 1),
+                    image::DynamicImage::new_rgb8(2, 1),
+                    image::DynamicImage::new_rgb8(3, 1),
+                ],
+                24.0,
+                None,
+            )]),
+            None,
+            None,
+            None,
+        );
+
+        seq.keep_num_video_frames(2);
+
+        let videos = seq.clone_videos().unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].frames.len(), 2);
+        assert_eq!(videos[0].frames[0].width(), 2);
+        assert_eq!(seq.multimodal.video_hashes().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn video_retention_by_item_keeps_complete_videos() {
+        let mut seq = make_test_sequence();
+        seq.multimodal = MultimodalData::new(
+            None,
+            None,
+            Some(vec![
+                VideoInput::from_frames(vec![image::DynamicImage::new_rgb8(1, 1)], 24.0, None),
+                VideoInput::from_frames(
+                    vec![
+                        image::DynamicImage::new_rgb8(2, 1),
+                        image::DynamicImage::new_rgb8(3, 1),
+                    ],
+                    24.0,
+                    None,
+                ),
+            ]),
+            None,
+            None,
+            None,
+        );
+
+        seq.keep_num_videos(1);
+
+        let videos = seq.clone_videos().unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].frames.len(), 2);
+        assert_eq!(videos[0].frames[0].width(), 2);
+    }
+
+    #[test]
+    fn non_chunk_media_accessors_preserve_full_media() {
+        let mut seq = make_test_sequence();
+        add_test_media(&mut seq);
+
+        assert_eq!(seq.image_hashes().unwrap().len(), 1);
+        assert_eq!(seq.take_images().unwrap().len(), 1);
+        assert_eq!(seq.audio_hashes().unwrap().len(), 1);
+        assert_eq!(seq.take_audios().unwrap().len(), 1);
+        assert_eq!(seq.video_hashes().unwrap().len(), 1);
+        assert_eq!(seq.take_videos().unwrap().len(), 1);
     }
 }

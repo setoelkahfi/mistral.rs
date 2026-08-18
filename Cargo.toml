@@ -33,7 +33,9 @@ rust-version = "1.94"
 [workspace.dependencies]
 # onde-candle-{core,nn} are the upstream candle rev 27f20fea snapshot published to
 # crates.io (mistral.rs needs post-0.11.0 APIs); metal-kernels and flash-attn-v3 are
-# unchanged at that rev, so the official crates serve them.
+# unchanged at that rev, so the official crates serve them. Upstream master has since
+# moved to candle rev 35d7ae7c; we stay on the published snapshot because this fork is
+# released to crates.io and cannot carry git dependencies.
 candle-core = { version = "0.11.0", package = "onde-candle-core" }
 candle-nn = { version = "0.11.0", package = "onde-candle-nn" }
 candle-flash-attn-v3 = { version = "0.11.0" }
@@ -44,6 +46,7 @@ mimalloc = "0.1"
 anyhow = "1.0.100"
 serde = "1.0.228"
 serde_json = "1.0.149"
+sha2 = "0.10.9"
 indexmap = { version = "2.13.0", features = ["serde"] }
 either = { version = "1.15.0", features = ["serde"] }
 accelerate-src = { version = "0.3.2" }
@@ -89,6 +92,7 @@ walkdir = "2.5.0"
 data-url = "0.3.2"
 float8 = "0.7.0"
 regex = "1.12.2"
+fancy-regex = "0.14.0"
 objc2-metal = "0.3.2"
 objc2-foundation = "0.3.2"
 dispatch2 = { version = "0.3.0", default-features = false, features = ["block2"] }
@@ -176,6 +180,7 @@ axum_static = "1.8.6"
 mime_guess = "2.0.5"
 include_dir = "0.7.4"
 http = "1.4.0"
+http-body = "1.0.1"
 hyper = "1.8.1"
 rust-mcp-schema = { version = "0.9.5", default-features = false, features = ["schema_utils", "latest"] }
 cudaforge = "0.1.2"

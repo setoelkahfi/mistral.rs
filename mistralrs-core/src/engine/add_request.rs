@@ -25,6 +25,18 @@ use crate::{
 
 use super::{agentic_loop, Engine, TERMINATE_ALL_NEXT_STEP};
 
+fn tools_for_chat_template(
+    tools: Option<&[crate::Tool]>,
+    tool_choice: Option<&ToolChoice>,
+    format: Option<ToolCallFormat>,
+) -> Vec<crate::Tool> {
+    if format == Some(ToolCallFormat::Atem) && matches!(tool_choice, Some(ToolChoice::None)) {
+        Vec::new()
+    } else {
+        tools.unwrap_or_default().to_vec()
+    }
+}
+
 impl Engine {
     pub async fn handle_request(self: Arc<Self>, request: Request) {
         match request {
@@ -105,6 +117,22 @@ impl Engine {
     }
 
     pub(super) async fn add_request(&self, request: NormalRequest) {
+        let adapter_lease = match request.adapter.as_ref() {
+            Some(selection) => match selection.lease() {
+                Some(lease) => Some(lease.clone()),
+                None => {
+                    request
+                        .response
+                        .send(Response::ValidationError(
+                            "request adapter selection was not pinned before admission".into(),
+                        ))
+                        .await
+                        .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                    return;
+                }
+            },
+            None => None,
+        };
         let is_chat = matches!(
             request.messages,
             RequestMessage::Chat { .. } | RequestMessage::MultimodalChat { .. }
@@ -212,15 +240,17 @@ impl Engine {
                 .get_chat_template()
                 .and_then(|chat_template| chat_template.tool_call_format())
         };
-        let uses_harmony_tool_call_strategy =
-            preferred_tool_call_format == Some(ToolCallFormat::Harmony);
+        let uses_channel_tool_call_strategy = matches!(
+            preferred_tool_call_format,
+            Some(ToolCallFormat::Harmony | ToolCallFormat::Atem)
+        );
         let validates_forced_tool_choice = request
             .tool_choice
             .as_ref()
             .is_some_and(|choice| choice.forced_function_name().is_some());
         let needs_tool_call_state =
-            has_tools || uses_harmony_tool_call_strategy || validates_forced_tool_choice;
-        if uses_harmony_tool_call_strategy
+            has_tools || uses_channel_tool_call_strategy || validates_forced_tool_choice;
+        if preferred_tool_call_format == Some(ToolCallFormat::Harmony)
             && !crate::reasoning_parsers::harmony::is_harmony_encoding_ready()
         {
             if let Err(e) = tokio::task::block_in_place(|| {
@@ -271,7 +301,11 @@ impl Engine {
                 reasoning_effort,
             } => {
                 let pipeline = &*get_mut_arcmutex!(self.pipeline);
-                let tools = request.tools.clone().unwrap_or_default();
+                let tools = tools_for_chat_template(
+                    request.tools.as_deref(),
+                    request.tool_choice.as_ref(),
+                    preferred_tool_call_format,
+                );
                 let template = pipeline.get_processor().process(
                     pipeline,
                     messages,
@@ -698,12 +732,11 @@ impl Engine {
                 image_gen_save_file.clone(),
                 seq_preallocated_cache,
                 request.return_raw_logits,
+                request.sampling_params.ignore_eos,
                 eos_toks,
             );
-
-            // Only "track" a new sequence if it is a traditional one
-            if matches!(seq_step_type, SeqStepType::PromptAndDecode) {
-                self.logger.add_new_sequence();
+            if let Some(adapter_lease) = &adapter_lease {
+                seq.bind_adapter(adapter_lease.clone());
             }
 
             {
@@ -750,60 +783,86 @@ impl Engine {
                 }
             }
 
-            // Allocate recurrent state pool slot for hybrid models
-            {
-                let pipeline = get_mut_arcmutex!(self.pipeline);
-                if !pipeline.get_metadata().no_kv_cache && pipeline.cache().is_hybrid() {
-                    let mut hybrid_cache = pipeline.cache().hybrid();
-                    if let Some(slot_idx) = hybrid_cache.allocate_seq() {
-                        seq.set_recurrent_state_idx(Some(slot_idx));
-                    }
-                }
-            }
-
             // Run the inputs processor to normalize multimodal prompts before prefix-cache lookup.
             // Rely on the sequence's attached modalities rather than just the top-level request
             // fields so historical images/audios in a reconstructed multi-turn conversation
             // still get their prompt rewrite and mm-feature setup before cache matching.
             if seq.has_images() || seq.has_audios() || seq.has_videos() {
                 let pipeline = get_mut_arcmutex!(self.pipeline);
-                let _ = pipeline.get_processor().inputs_processor().process_inputs(
-                    pipeline.tokenizer(),
-                    &mut [&mut seq],
-                    true,
-                    pipeline.get_metadata().is_xlora,
-                    &pipeline.device(),
-                    pipeline.get_metadata().no_kv_cache,
-                    None,
-                    false,
-                    pipeline.get_metadata().sliding_window,
-                    pipeline.get_input_processor_config(),
-                    None,
-                    pipeline.device_mapper(),
+                handle_seq_error!(
+                    pipeline
+                        .get_processor()
+                        .inputs_processor()
+                        .prepare_for_paged_prompt_planning(
+                            pipeline.tokenizer(),
+                            &mut [&mut seq],
+                            &pipeline.device(),
+                            pipeline.get_input_processor_config(),
+                            None,
+                        ),
+                    request.response
                 );
             }
 
-            let prefill_cache = handle_seq_error!(
-                get_mut_arcmutex!(self.prefix_cacher).search_for_matching_cache(
-                    seq.get_toks(),
-                    seq.image_hashes(),
-                    seq.audio_hashes(),
-                    seq.video_hashes(),
-                ),
-                request.response
-            );
+            let prefill_cache = if seq.return_raw_logits {
+                None
+            } else {
+                handle_seq_error!(
+                    get_mut_arcmutex!(self.prefix_cacher).search_for_matching_cache(
+                        seq.get_toks(),
+                        seq.adapter_generation(),
+                        seq.mm_features(),
+                        seq.image_hashes(),
+                        seq.audio_hashes(),
+                        seq.video_hashes(),
+                    ),
+                    request.response
+                )
+            };
 
+            let recurrent_slot_allocation_failed = {
+                let pipeline = get_mut_arcmutex!(self.pipeline);
+                if !pipeline.get_metadata().no_kv_cache && pipeline.cache().is_hybrid() {
+                    let mut hybrid_cache = pipeline.cache().hybrid();
+                    if let Some(slot_idx) = hybrid_cache.allocate_seq() {
+                        seq.set_recurrent_state_idx(Some(slot_idx));
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            };
+            if recurrent_slot_allocation_failed {
+                request
+                    .response
+                    .send(Response::InternalError(
+                        "Failed to allocate recurrent state for request."
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                return;
+            }
+
+            if matches!(seq_step_type, SeqStepType::PromptAndDecode) {
+                self.logger.add_new_sequence();
+            }
             seq = match prefill_cache.clone() {
                 Some(MatchingCache::Normal {
                     normal,
                     recurrent_snapshots,
                     images_to_keep,
                     audios_to_keep,
-                    videos_to_keep,
+                    video_frames_to_keep,
                     toks,
                     offset,
                 }) => {
-                    self.logger.add_prefix_cache_hit();
+                    if seq.record_prefix_cache_hit() {
+                        self.logger.add_prefix_cache_hit();
+                    }
 
                     // Restore recurrent state for hybrid models
                     if let Some(snapshots) = recurrent_snapshots {
@@ -822,9 +881,15 @@ impl Engine {
                         }
                     }
 
-                    seq.keep_num_images(images_to_keep);
+                    let retain_prefix_cached_images = {
+                        let pipeline = get_mut_arcmutex!(self.pipeline);
+                        pipeline.get_processor().retain_prefix_cached_images()
+                    };
+                    if !retain_prefix_cached_images {
+                        seq.keep_num_images(images_to_keep);
+                    }
                     seq.keep_num_audios(audios_to_keep);
-                    seq.keep_num_videos(videos_to_keep);
+                    seq.keep_num_video_frames(video_frames_to_keep);
                     seq.prefill_v2_normal(normal, toks, offset)
                 }
                 None => seq,
@@ -940,5 +1005,65 @@ impl Engine {
             .send(Ok(txt))
             .await
             .expect("Sender disconnected unexpectedly!");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::chat_template::{apply_chat_template_to, ChatTemplateValue};
+    use crate::{Function, Tool, ToolType};
+    use indexmap::IndexMap;
+
+    fn tool() -> Tool {
+        Tool {
+            tp: ToolType::Function,
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: None,
+                strict: None,
+            },
+        }
+    }
+
+    #[test]
+    fn atem_tool_choice_none_omits_tools_from_the_rendered_prompt() {
+        let tools = vec![tool()];
+        let rendered_tools = tools_for_chat_template(
+            Some(&tools),
+            Some(&ToolChoice::None),
+            Some(ToolCallFormat::Atem),
+        );
+        let messages = vec![IndexMap::from([
+            ("role".to_string(), Either::Left("user".to_string())),
+            ("content".to_string(), Either::Left("hello".to_string())),
+        ])];
+        let template = ChatTemplateValue(Either::Left(
+            "{% if tools %}tools{% else %}no-tools{% endif %}<atem:function_calls><atem:invoke"
+                .to_string(),
+        ));
+
+        let rendered = apply_chat_template_to(
+            messages,
+            true,
+            None,
+            None,
+            &template,
+            None,
+            None,
+            None,
+            rendered_tools,
+        )
+        .unwrap();
+
+        assert!(rendered.starts_with("no-tools"));
+        let qwen_tools = tools_for_chat_template(
+            Some(&tools),
+            Some(&ToolChoice::None),
+            Some(ToolCallFormat::Qwen),
+        );
+        assert_eq!(qwen_tools.len(), 1);
+        assert_eq!(qwen_tools[0].function.name, "get_weather");
     }
 }

@@ -1,17 +1,22 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use tracing::info;
 
+#[derive(Default)]
+struct PrefixCacheStats {
+    hits: usize,
+    total_sequences: usize,
+}
+
 pub struct IntervalLogger {
     enable_logging: Arc<AtomicBool>,
-    prefix_cache_hits: Arc<AtomicUsize>,
+    prefix_cache_stats: Arc<Mutex<PrefixCacheStats>>,
     tokens_processed: Arc<AtomicUsize>,
-    total_new_seqs: Arc<AtomicUsize>,
     num_running: Arc<AtomicUsize>,
     num_waiting: Arc<AtomicUsize>,
     encoder_cache_hits: Option<Arc<AtomicUsize>>,
@@ -24,16 +29,14 @@ impl IntervalLogger {
         interval: Duration,
         encoder_cache_counters: Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
     ) -> Self {
-        let prefix_cache_hits = Arc::new(AtomicUsize::new(0));
+        let prefix_cache_stats = Arc::new(Mutex::new(PrefixCacheStats::default()));
         let tokens_processed = Arc::new(AtomicUsize::new(0));
-        let total_new_seqs = Arc::new(AtomicUsize::new(0));
         let enable_logging = Arc::new(AtomicBool::new(false));
         let num_running = Arc::new(AtomicUsize::new(0));
         let num_waiting = Arc::new(AtomicUsize::new(0));
 
-        let t_prefix_cache_hits = prefix_cache_hits.clone();
+        let t_prefix_cache_stats = prefix_cache_stats.clone();
         let t_tokens_processed = tokens_processed.clone();
-        let t_total_new_seqs = total_new_seqs.clone();
         let t_enable_logging = enable_logging.clone();
         let t_num_running = num_running.clone();
         let t_num_waiting = num_waiting.clone();
@@ -51,8 +54,16 @@ impl IntervalLogger {
                     continue;
                 }
 
-                let total_new_seqs = t_total_new_seqs.load(Ordering::Relaxed);
-                let prefix_cache_hits = t_prefix_cache_hits.load(Ordering::Relaxed);
+                let (prefix_cache_hits, total_new_seqs) = {
+                    let stats = t_prefix_cache_stats.lock().unwrap();
+                    (stats.hits, stats.total_sequences)
+                };
+                if let (Some(hits), Some(misses)) = (&t_enc_hits, &t_enc_misses) {
+                    metrics::counter!("mistralrs_encoder_cache_hits_total")
+                        .absolute(hits.load(Ordering::Relaxed) as u64);
+                    metrics::counter!("mistralrs_encoder_cache_misses_total")
+                        .absolute(misses.load(Ordering::Relaxed) as u64);
+                }
                 let tokens_processed = t_tokens_processed.swap(0, Ordering::Relaxed);
                 let num_running = t_num_running.load(Ordering::Relaxed);
                 let num_waiting = t_num_waiting.load(Ordering::Relaxed);
@@ -89,9 +100,8 @@ impl IntervalLogger {
         });
 
         Self {
-            prefix_cache_hits,
+            prefix_cache_stats,
             tokens_processed,
-            total_new_seqs,
             enable_logging,
             num_running,
             num_waiting,
@@ -106,9 +116,8 @@ impl IntervalLogger {
 
     /// Reset all counters to zero. Call after warmup/dummy runs to get clean stats.
     pub fn reset(&self) {
-        self.prefix_cache_hits.store(0, Ordering::Relaxed);
+        *self.prefix_cache_stats.lock().unwrap() = PrefixCacheStats::default();
         self.tokens_processed.store(0, Ordering::Relaxed);
-        self.total_new_seqs.store(0, Ordering::Relaxed);
         self.num_running.store(0, Ordering::Relaxed);
         self.num_waiting.store(0, Ordering::Relaxed);
         if let Some(ref hits) = self.encoder_cache_hits {
@@ -122,30 +131,33 @@ impl IntervalLogger {
     pub fn add_tokens_processed(&self, num_tokens: usize) {
         self.tokens_processed
             .fetch_add(num_tokens, Ordering::Relaxed);
+        metrics::counter!("mistralrs_tokens_processed_total").increment(num_tokens as u64);
     }
 
     pub fn add_new_sequence(&self) {
-        self.total_new_seqs.fetch_add(1, Ordering::Relaxed);
+        self.prefix_cache_stats.lock().unwrap().total_sequences += 1;
+        metrics::counter!("mistralrs_prefix_cache_lookups_total").increment(1);
     }
 
     pub fn add_prefix_cache_hit(&self) {
-        self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.prefix_cache_stats.lock().unwrap().hits += 1;
+        metrics::counter!("mistralrs_prefix_cache_hits_total").increment(1);
     }
 
     pub fn set_num_running(&self, running: usize) {
         self.num_running.store(running, Ordering::Relaxed);
+        metrics::gauge!("mistralrs_sequences_running").set(running as f64);
     }
 
     pub fn set_num_waiting(&self, waiting: usize) {
         self.num_waiting.store(waiting, Ordering::Relaxed);
+        metrics::gauge!("mistralrs_sequences_waiting").set(waiting as f64);
     }
 
     /// Return cumulative prefix cache (hits, total_sequences).
     pub fn prefix_cache_stats(&self) -> (usize, usize) {
-        (
-            self.prefix_cache_hits.load(Ordering::Relaxed),
-            self.total_new_seqs.load(Ordering::Relaxed),
-        )
+        let stats = self.prefix_cache_stats.lock().unwrap();
+        (stats.hits, stats.total_sequences)
     }
 
     /// Return cumulative encoder cache (hits, misses), or `None` if no encoder cache exists.

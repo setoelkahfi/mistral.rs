@@ -13,8 +13,8 @@ use candle_nn::{
 use float8::F8E4M3;
 use half::{bf16, f16};
 use mistralrs_quant::{
-    AfqLayer, ColumnParallelLayer, Convolution, QuantMethod, QuantizedConfig, RowParallelLayer,
-    ShardedVarBuilder,
+    should_apply_immediate_isq, ColumnParallelLayer, Convolution, QuantMethod, QuantMethodConfig,
+    QuantizedConfig, ReplicatedLayer, RowParallelLayer, ShardedVarBuilder, UnquantLinear,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,21 +38,87 @@ use crate::{
 
 pub use mistralrs_quant::MatMul;
 
+pub fn dense_embedding(
+    in_size: usize,
+    out_size: usize,
+    vb: ShardedVarBuilder,
+    _config: &Option<QuantizedConfig>,
+) -> Result<Embedding> {
+    let embeddings = vb.get_with_hints((in_size, out_size), "weight", Default::default())?;
+    Ok(Embedding::new(embeddings, out_size))
+}
+
+fn contains_tensor_or_weight_source_with(
+    residual_contains: bool,
+    prefix: &str,
+    name: &str,
+    source_contains: impl Fn(&str) -> bool,
+) -> bool {
+    if residual_contains {
+        return true;
+    }
+    let name = if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    };
+    source_contains(&name)
+}
+
+pub fn contains_tensor_or_weight_source(vb: &ShardedVarBuilder, name: &str) -> bool {
+    contains_tensor_or_weight_source_with(vb.contains_tensor(name), &vb.prefix(), name, |name| {
+        vb.weight_source()
+            .is_some_and(|source| source.contains(name))
+    })
+}
+
+pub fn contains_tensor_or_uqff(vb: &ShardedVarBuilder, name: &str) -> bool {
+    contains_tensor_or_weight_source(vb, name)
+}
+
 pub fn embedding(
     in_size: usize,
     out_size: usize,
     vb: ShardedVarBuilder,
     config: &Option<QuantizedConfig>,
-) -> Result<Embedding> {
-    // AFQ quantized applies quantization to the embeddings.
-    let embeddings = if let Some(QuantizedConfig::Afq { .. }) = config {
-        let afq_layer =
-            AfqLayer::afq_linear_b(out_size, in_size, config.as_ref().unwrap(), false, vb)?;
-        afq_layer.dequantize_w()?
+) -> Result<Arc<dyn QuantMethod>> {
+    if matches!(config, Some(QuantizedConfig::Afq { .. }))
+        || should_apply_immediate_isq(&vb)
+        || vb.weight_source().is_some()
+    {
+        ReplicatedLayer::new(out_size, in_size, config, false, vb)
     } else {
-        vb.get_with_hints((in_size, out_size), "weight", Default::default())?
-    };
-    Ok(Embedding::new(embeddings, out_size))
+        let weight = vb.get_with_hints((in_size, out_size), "weight", Default::default())?;
+        Ok(Arc::new(UnquantLinear::new(
+            QuantMethodConfig::Unquantized(Linear::new(weight, None)),
+        )?))
+    }
+}
+
+fn use_legacy_tied_uqff_head(
+    embedding_prefix: &str,
+    lm_head_prefix: &str,
+    contains: impl Fn(&str) -> bool,
+) -> bool {
+    !contains(&format!("{embedding_prefix}.weight"))
+        && contains(&format!("{lm_head_prefix}.weight"))
+}
+
+pub fn embedding_with_legacy_tied_uqff(
+    in_size: usize,
+    out_size: usize,
+    vb: ShardedVarBuilder,
+    legacy_lm_head_vb: Option<ShardedVarBuilder>,
+    config: &Option<QuantizedConfig>,
+) -> Result<Arc<dyn QuantMethod>> {
+    if let (Some(source), Some(lm_head_vb)) = (vb.weight_source(), legacy_lm_head_vb) {
+        if use_legacy_tied_uqff_head(&vb.prefix(), &lm_head_vb.prefix(), |name| {
+            source.contains(name)
+        }) {
+            return ReplicatedLayer::new(out_size, in_size, &None, false, lm_head_vb);
+        }
+    }
+    embedding(in_size, out_size, vb, config)
 }
 
 pub fn layer_norm<C: Into<LayerNormConfig>>(
@@ -612,6 +678,7 @@ pub enum PhiRopeScalingConfig {
 
 pub struct PhiRopeConfig {
     pub rope_scaling: Option<PhiRopeScalingConfig>,
+    pub scaling_attn_factor: Option<f64>,
     pub max_position_embeddings: usize,
     pub original_max_position_embeddings: usize,
     pub rope_theta: f64,
@@ -620,6 +687,51 @@ pub struct PhiRopeConfig {
 }
 
 impl PhiRotaryEmbedding {
+    fn new_tensor_scaled(
+        short_factor: &Tensor,
+        long_factor: &Tensor,
+        scaling_factor: f64,
+        cfg: &PhiRopeConfig,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Self> {
+        let max_seq_len = cfg.max_position_embeddings;
+        let dim = (cfg.head_dim as f64 * cfg.partial_rotary_factor.unwrap_or(1.)) as usize;
+        let factor_len = dim / 2;
+        if short_factor.elem_count() != factor_len || long_factor.elem_count() != factor_len {
+            candle_core::bail!(
+                "LongRoPE factor lengths must both be {factor_len}, got {} and {}",
+                short_factor.elem_count(),
+                long_factor.elem_count()
+            );
+        }
+        let inv_freq = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+            .collect::<Vec<_>>();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, factor_len), dev)?;
+        let short_factor = short_factor
+            .to_device(dev)?
+            .to_dtype(DType::F32)?
+            .reshape((1, factor_len))?;
+        let long_factor = long_factor
+            .to_device(dev)?
+            .to_dtype(DType::F32)?
+            .reshape((1, factor_len))?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let short_freqs = t.matmul(&inv_freq.broadcast_div(&short_factor)?)?;
+        let long_freqs = t.matmul(&inv_freq.broadcast_div(&long_factor)?)?;
+        Ok(Self {
+            short_sin: short_freqs.sin()?.mul(scaling_factor)?.to_dtype(dtype)?,
+            short_cos: short_freqs.cos()?.mul(scaling_factor)?.to_dtype(dtype)?,
+            long_sin: Some(long_freqs.sin()?.mul(scaling_factor)?.to_dtype(dtype)?),
+            long_cos: Some(long_freqs.cos()?.mul(scaling_factor)?.to_dtype(dtype)?),
+            original_max_position_embeddings: cfg.original_max_position_embeddings,
+        })
+    }
+
     fn new_classic_scaled(
         short_factor: &[f64],
         long_factor: &[f64],
@@ -790,8 +902,33 @@ impl PhiRotaryEmbedding {
     }
 
     pub fn new(dtype: DType, cfg: impl Into<PhiRopeConfig>, dev: &Device) -> Result<Self> {
+        Self::new_with_factors(dtype, cfg, dev, None, None)
+    }
+
+    pub fn new_with_factors(
+        dtype: DType,
+        cfg: impl Into<PhiRopeConfig>,
+        dev: &Device,
+        short_factor: Option<&Tensor>,
+        long_factor: Option<&Tensor>,
+    ) -> Result<Self> {
         let cfg: PhiRopeConfig = cfg.into();
 
+        match (short_factor, long_factor) {
+            (Some(short_factor), Some(long_factor)) => {
+                return Self::new_tensor_scaled(
+                    short_factor,
+                    long_factor,
+                    cfg.scaling_attn_factor
+                        .context("GGUF LongRoPE attention factor is required")?,
+                    &cfg,
+                    dtype,
+                    dev,
+                )
+            }
+            (None, None) => {}
+            _ => candle_core::bail!("GGUF LongRoPE requires both short and long factor tensors"),
+        }
         match &cfg.rope_scaling {
             Some(PhiRopeScalingConfig::Classic {
                 short_factor,
@@ -898,6 +1035,38 @@ impl Llama3RotaryEmbedding {
         dev: &Device,
         is_gpt_neox: bool,
     ) -> Result<Self> {
+        Self::new_llama3_with_factors(dtype, cfg, dev, is_gpt_neox, None)
+    }
+
+    pub fn new_llama3_with_factors(
+        dtype: DType,
+        cfg: &llama::Config,
+        dev: &Device,
+        is_gpt_neox: bool,
+        freq_factors: Option<&Tensor>,
+    ) -> Result<Self> {
+        if let Some(freq_factors) = freq_factors {
+            let inv_freq = Tensor::from_vec(
+                calculate_default_inv_freq(cfg),
+                (1, freq_factors.elem_count()),
+                dev,
+            )?
+            .broadcast_div(
+                &freq_factors
+                    .to_device(dev)?
+                    .to_dtype(DType::F32)?
+                    .reshape((1, freq_factors.elem_count()))?,
+            )?;
+            let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, dev)?
+                .to_dtype(DType::F32)?
+                .reshape((cfg.max_position_embeddings, 1))?;
+            let freqs = t.matmul(&inv_freq)?;
+            return Ok(Self(RotaryEmbedding {
+                sin: freqs.sin()?.to_dtype(dtype)?,
+                cos: freqs.cos()?.to_dtype(dtype)?,
+                is_gpt_neox,
+            }));
+        }
         match &cfg.rope_scaling {
             None
             | Some(Llama3RopeConfig {
@@ -1225,6 +1394,38 @@ impl SmolLm3RotaryEmbedding {
         dev: &Device,
         is_gpt_neox: bool,
     ) -> Result<Self> {
+        Self::new_llama3_with_factors(dtype, cfg, dev, is_gpt_neox, None)
+    }
+
+    pub fn new_llama3_with_factors(
+        dtype: DType,
+        cfg: &smollm3::Config,
+        dev: &Device,
+        is_gpt_neox: bool,
+        freq_factors: Option<&Tensor>,
+    ) -> Result<Self> {
+        if let Some(freq_factors) = freq_factors {
+            let inv_freq = Tensor::from_vec(
+                calculate_default_inv_freq_smollm3(cfg),
+                (1, freq_factors.elem_count()),
+                dev,
+            )?
+            .broadcast_div(
+                &freq_factors
+                    .to_device(dev)?
+                    .to_dtype(DType::F32)?
+                    .reshape((1, freq_factors.elem_count()))?,
+            )?;
+            let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, dev)?
+                .to_dtype(DType::F32)?
+                .reshape((cfg.max_position_embeddings, 1))?;
+            let freqs = t.matmul(&inv_freq)?;
+            return Ok(Self(RotaryEmbedding {
+                sin: freqs.sin()?.to_dtype(dtype)?,
+                cos: freqs.cos()?.to_dtype(dtype)?,
+                is_gpt_neox,
+            }));
+        }
         match &cfg.rope_scaling {
             None
             | Some(SmolLm3RopeConfig {
@@ -2353,6 +2554,18 @@ pub struct RotaryEmbedding {
     is_gpt_neox: bool,
 }
 
+pub struct YarnRopeConfig {
+    pub base: f32,
+    pub head_dim: usize,
+    pub max_position_embeddings: usize,
+    pub original_max_position_embeddings: usize,
+    pub factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub mscale: f32,
+    pub mscale_all_dim: f32,
+}
+
 fn post_rope_output(mut x: Tensor) -> Result<Tensor> {
     if !(cfg!(feature = "flash-attn") || cfg!(feature = "flash-attn-v3")) {
         x = x.contiguous()?;
@@ -2601,6 +2814,53 @@ impl RotaryEmbedding {
         Ok(Self {
             cos,
             sin,
+            is_gpt_neox,
+        })
+    }
+
+    pub fn new_yarn(
+        cfg: &YarnRopeConfig,
+        device: &Device,
+        is_gpt_neox: bool,
+        dtype: DType,
+    ) -> Result<Self> {
+        let freq_extra = (0..cfg.head_dim)
+            .step_by(2)
+            .map(|i| 1f32 / cfg.base.powf(i as f32 / cfg.head_dim as f32))
+            .collect::<Vec<_>>();
+        let freq_inter = (0..cfg.head_dim)
+            .step_by(2)
+            .map(|i| 1f32 / (cfg.factor * cfg.base.powf(i as f32 / cfg.head_dim as f32)))
+            .collect::<Vec<_>>();
+        let freq_len = freq_extra.len();
+        let freq_extra = Tensor::from_vec(freq_extra, (1, freq_len), device)?;
+        let freq_inter = Tensor::from_vec(freq_inter, (1, freq_len), device)?;
+        let (low, high) = DeepSeekV2RotaryEmbedding::yarn_find_correction_range(
+            cfg.beta_fast,
+            cfg.beta_slow,
+            cfg.head_dim,
+            cfg.base,
+            cfg.original_max_position_embeddings,
+        );
+        let inv_freq_mask = (1.
+            - DeepSeekV2RotaryEmbedding::yarn_linear_ramp_mask(
+                low,
+                high,
+                cfg.head_dim / 2,
+                device,
+            )?)?;
+        let inv_freq = freq_inter
+            .broadcast_mul(&(1. - &inv_freq_mask)?)?
+            .broadcast_add(&freq_extra.broadcast_mul(&inv_freq_mask)?)?;
+        let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((cfg.max_position_embeddings, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        let mscale = DeepSeekV2RotaryEmbedding::yarn_get_mscale(cfg.factor, cfg.mscale)
+            / DeepSeekV2RotaryEmbedding::yarn_get_mscale(cfg.factor, cfg.mscale_all_dim);
+        Ok(Self {
+            sin: (freqs.sin()? * mscale as f64)?.to_dtype(dtype)?,
+            cos: (freqs.cos()? * mscale as f64)?.to_dtype(dtype)?,
             is_gpt_neox,
         })
     }
@@ -3132,11 +3392,32 @@ impl Mlp {
         hidden_act: Activation,
         comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
+        Self::new_with_bias(
+            vb,
+            hidden_size,
+            intermediate_size,
+            quantization_config,
+            hidden_act,
+            false,
+            comm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_bias(
+        vb: ShardedVarBuilder,
+        hidden_size: usize,
+        intermediate_size: usize,
+        quantization_config: &Option<QuantizedConfig>,
+        hidden_act: Activation,
+        bias: bool,
+        comm: &Arc<mistralrs_quant::Comm>,
+    ) -> Result<Self> {
         let gate = ColumnParallelLayer::new(
             hidden_size,
             intermediate_size,
             quantization_config,
-            false,
+            bias,
             comm,
             vb.pp("gate_proj"),
         )?;
@@ -3144,11 +3425,11 @@ impl Mlp {
             hidden_size,
             intermediate_size,
             quantization_config,
-            false,
+            bias,
             comm,
             vb.pp("up_proj"),
         )?;
-        let merged_gate_up = crate::ops::MergedDenseProjection::new(&[&*gate, &*up])?;
+        let merged_gate_up = crate::ops::MergedDenseProjection::new(&[gate.clone(), up.clone()])?;
 
         Ok(Self {
             gate,
@@ -3157,7 +3438,7 @@ impl Mlp {
                 intermediate_size,
                 hidden_size,
                 quantization_config,
-                false,
+                bias,
                 comm,
                 vb.pp("down_proj"),
             )?,
@@ -3189,7 +3470,7 @@ impl Mlp {
 
         let gate = gate_up_projs[0].to_owned();
         let up = gate_up_projs[1].to_owned();
-        let merged_gate_up = crate::ops::MergedDenseProjection::new(&[&*gate, &*up])?;
+        let merged_gate_up = crate::ops::MergedDenseProjection::new(&[gate.clone(), up.clone()])?;
 
         Ok(Self {
             gate,
@@ -3278,7 +3559,7 @@ impl MlpLayer for Mlp {
             self.down.clone()
         };
 
-        let merged_gate_up = crate::ops::MergedDenseProjection::new(&[&*gate, &*up])?;
+        let merged_gate_up = crate::ops::MergedDenseProjection::new(&[gate.clone(), up.clone()])?;
 
         Ok(Box::new(Self {
             gate,
@@ -3415,5 +3696,53 @@ impl Module for ScaledEmbedding {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let embedding = Embedding::new(self.embedding.clone(), self.embedding.dim(D::Minus1)?);
         xs.apply(&embedding)? * self.scale
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{contains_tensor_or_weight_source_with, use_legacy_tied_uqff_head};
+    use std::collections::HashSet;
+
+    #[test]
+    fn legacy_tied_uqff_head_is_only_used_without_a_packed_embedding() {
+        let embedding = "model.embed_tokens.weight";
+        let lm_head = "lm_head.weight";
+
+        for (names, expected) in [
+            (HashSet::from([lm_head]), true),
+            (HashSet::from([embedding, lm_head]), false),
+            (HashSet::from([embedding]), false),
+            (HashSet::new(), false),
+        ] {
+            assert_eq!(
+                use_legacy_tied_uqff_head("model.embed_tokens", "lm_head", |name| {
+                    names.contains(name)
+                }),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn tensor_presence_checks_residual_and_prefixed_weight_source_names() {
+        assert!(contains_tensor_or_weight_source_with(
+            true,
+            "model",
+            "embed_tokens.weight",
+            |_| false,
+        ));
+        assert!(contains_tensor_or_weight_source_with(
+            false,
+            "model",
+            "embed_tokens.weight",
+            |name| name == "model.embed_tokens.weight",
+        ));
+        assert!(!contains_tensor_or_weight_source_with(
+            false,
+            "model",
+            "embed_tokens.weight",
+            |name| name == "embed_tokens.weight",
+        ));
     }
 }

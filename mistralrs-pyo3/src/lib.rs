@@ -12,7 +12,8 @@ use either::Either;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use requests::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, PythonEmbeddingInputs, ToolChoice,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, LoraAdapterGeneration,
+    PythonEmbeddingInputs, ToolChoice,
 };
 use serde_json::Value;
 use std::{
@@ -38,12 +39,13 @@ use mistralrs_core::{
     DeviceMapSetting, DiffusionGenerationParams, DiffusionLoaderBuilder, DrySamplingParams,
     EmbeddingLoaderBuilder, EmbeddingSpecificConfig, GGMLLoaderBuilder, GGMLSpecificConfig,
     GGUFLoaderBuilder, GGUFSpecificConfig, ImageGenerationResponse, ImageGenerationResponseFormat,
-    LlguidanceGrammar, Loader, MemoryGpuConfig, MistralRs, MistralRsBuilder,
-    MultimodalLoaderBuilder, MultimodalSpecificConfig, NormalLoaderBuilder, NormalRequest,
-    NormalSpecificConfig, PagedAttentionConfig, PagedCacheType, ReasoningEffort,
-    Request as _Request, RequestMessage, Response, ResponseOk, SamplingParams, SchedulerConfig,
-    SearchEmbeddingModel, SpeculativeConfig, SpeechLoader, StopTokens, TokenSource,
-    TokenizationRequest, Tool, Topology, UqffWriteConfig,
+    LlguidanceGrammar, Loader, LoraAdapterError as CoreLoraAdapterError, LoraAdapterLoadPolicy,
+    LoraAdapterSpec, LoraRuntimeConfig, MemoryGpuConfig, MistralRs, MistralRsBuilder,
+    MistralRsError, MultimodalLoaderBuilder, MultimodalSpecificConfig, NormalLoaderBuilder,
+    NormalRequest, NormalSpecificConfig, PagedAttentionConfig, PagedCacheType, Request as _Request,
+    RequestMessage, Response, ResponseOk, SamplingParams, SchedulerConfig, SearchEmbeddingModel,
+    SpeculativeConfig, SpeechLoader, StopTokens, TokenSource, TokenizationRequest, Tool, Topology,
+    UqffWriteConfig,
 };
 use mistralrs_core::{
     CalledFunction, SearchCallback, SearchFunctionParameters, SearchResult, ToolCallback,
@@ -64,21 +66,199 @@ mod requests;
 mod stream;
 mod util;
 mod which;
-use which::{Architecture, DiffusionArchitecture, MultimodalArchitecture, SpeechLoaderType, Which};
-
-/// Parse reasoning effort string to ReasoningEffort enum
-fn parse_reasoning_effort(effort: &Option<String>) -> Option<ReasoningEffort> {
-    effort
-        .as_ref()
-        .and_then(|e| match e.to_lowercase().as_str() {
-            "low" => Some(ReasoningEffort::Low),
-            "medium" => Some(ReasoningEffort::Medium),
-            "high" => Some(ReasoningEffort::High),
-            _ => None,
-        })
-}
+use which::{
+    Architecture, DiffusionArchitecture, LoraAdapter, MultimodalArchitecture, SpeechLoaderType,
+    Which,
+};
 
 static DEVICE: OnceLock<Result<Device>> = OnceLock::new();
+
+pyo3::create_exception!(
+    mistralrs,
+    LoraAdapterError,
+    pyo3::exceptions::PyValueError,
+    "A dynamic LoRA lifecycle operation failed."
+);
+
+fn lora_adapter_error_code(error: &MistralRsError) -> &'static str {
+    match error {
+        MistralRsError::LoraAdapter(error) => match error {
+            CoreLoraAdapterError::RuntimeUnavailable { .. }
+            | CoreLoraAdapterError::TensorParallelUnsupported { .. }
+            | CoreLoraAdapterError::RuntimeChanged { .. } => "lora_runtime_unavailable",
+            CoreLoraAdapterError::InvalidAlias | CoreLoraAdapterError::AliasTooLong { .. } => {
+                "invalid_lora_name"
+            }
+            CoreLoraAdapterError::AliasLimit { .. } => "lora_alias_limit_exceeded",
+            CoreLoraAdapterError::LoadBusy => "lora_load_busy",
+            CoreLoraAdapterError::AlreadyLoaded { .. } => "lora_adapter_already_loaded",
+            CoreLoraAdapterError::GenerationMismatch { .. } => "lora_generation_mismatch",
+            CoreLoraAdapterError::NotFound { .. }
+            | CoreLoraAdapterError::GenerationNotFound { .. } => "lora_adapter_not_found",
+            CoreLoraAdapterError::GenerationConflict { .. } => "lora_generation_conflict",
+            CoreLoraAdapterError::RankLimit { .. } => "lora_rank_limit_exceeded",
+            CoreLoraAdapterError::AdapterLimit { .. } => "lora_adapter_limit_exceeded",
+            CoreLoraAdapterError::ByteLimit { .. } => "lora_byte_limit_exceeded",
+            CoreLoraAdapterError::SlotExhausted => "lora_slot_space_exhausted",
+            CoreLoraAdapterError::InvalidRuntimeConfig(_) => "invalid_lora_runtime",
+            CoreLoraAdapterError::SizeOverflow => "invalid_lora_adapter",
+            CoreLoraAdapterError::FileTooLarge { .. } => "lora_adapter_file_too_large",
+            CoreLoraAdapterError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                "adapter_file_not_found"
+            }
+            CoreLoraAdapterError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                "adapter_file_forbidden"
+            }
+            CoreLoraAdapterError::Io { source, .. }
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                "invalid_lora_adapter"
+            }
+            CoreLoraAdapterError::Io { .. } => "lora_storage_unavailable",
+            CoreLoraAdapterError::Config { .. } | CoreLoraAdapterError::Format(_) => {
+                "invalid_lora_adapter"
+            }
+            CoreLoraAdapterError::Load(_) => "lora_device_load_failed",
+            CoreLoraAdapterError::Task(_) => "lora_load_task_failed",
+            _ => "internal_error",
+        },
+        MistralRsError::ModelNotFound(_) => "model_not_found",
+        MistralRsError::ModelReloading(_)
+        | MistralRsError::ModelAlreadyLoaded(_)
+        | MistralRsError::ModelAlreadyUnloaded(_) => "model_state_conflict",
+        MistralRsError::NoLoaderConfig(_) => "invalid_model_operation",
+        MistralRsError::EnginePoisoned
+        | MistralRsError::SenderPoisoned
+        | MistralRsError::ReloadFailed(_)
+        | MistralRsError::Other(_) => "internal_error",
+    }
+}
+
+fn lora_adapter_py_error(code: &'static str, message: impl Into<String>) -> PyApiErr {
+    let error = LoraAdapterError::new_err(message.into());
+    if let Err(attribute_error) = Python::with_gil(|py| error.value(py).setattr("code", code)) {
+        return PyApiErr(attribute_error);
+    }
+    PyApiErr(error)
+}
+
+fn lora_adapter_core_py_error(error: MistralRsError) -> PyApiErr {
+    let code = lora_adapter_error_code(&error);
+    lora_adapter_py_error(code, error.to_string())
+}
+
+#[pyclass(name = "LoraAdapterInfo", get_all)]
+#[derive(Clone)]
+struct LoraAdapterInfoPy {
+    alias: String,
+    source: String,
+    revision: Option<String>,
+    generation: String,
+    rank: usize,
+    bytes: u64,
+}
+
+impl From<mistralrs_core::LoraAdapterInfo> for LoraAdapterInfoPy {
+    fn from(info: mistralrs_core::LoraAdapterInfo) -> Self {
+        Self {
+            alias: info.alias,
+            source: info.source,
+            revision: info.revision,
+            generation: info.generation.to_string(),
+            rank: info.rank,
+            bytes: info.bytes,
+        }
+    }
+}
+
+#[pymethods]
+impl LoraAdapterInfoPy {
+    /// Select this exact immutable generation in a request.
+    fn exact(&self) -> LoraAdapterGeneration {
+        LoraAdapterGeneration::parse(&self.generation).expect("stored adapter generation is valid")
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LoraAdapterInfo(alias={:?}, generation={:?}, rank={}, bytes={})",
+            self.alias, self.generation, self.rank, self.bytes
+        )
+    }
+}
+
+#[pyclass(name = "LoraRuntimeStatus", get_all)]
+#[derive(Clone)]
+struct LoraRuntimeStatusPy {
+    adapters: Vec<LoraAdapterInfoPy>,
+    generations: Vec<LoraResidentGenerationInfoPy>,
+    resident_generations: usize,
+    retired_generations: usize,
+    resident_bytes: u64,
+    max_adapters: usize,
+    max_rank: usize,
+    max_bytes: u64,
+}
+
+#[pyclass(name = "LoraResidentGenerationInfo", get_all)]
+#[derive(Clone)]
+struct LoraResidentGenerationInfoPy {
+    generation: String,
+    aliases: Vec<String>,
+    rank: usize,
+    bytes: u64,
+    retired: bool,
+    active_leases: usize,
+}
+
+impl From<mistralrs_core::LoraResidentGenerationInfo> for LoraResidentGenerationInfoPy {
+    fn from(info: mistralrs_core::LoraResidentGenerationInfo) -> Self {
+        Self {
+            generation: info.generation.to_string(),
+            aliases: info.aliases,
+            rank: info.rank,
+            bytes: info.bytes,
+            retired: info.retired,
+            active_leases: info.active_leases,
+        }
+    }
+}
+
+impl From<mistralrs_core::LoraRuntimeStatus> for LoraRuntimeStatusPy {
+    fn from(status: mistralrs_core::LoraRuntimeStatus) -> Self {
+        Self {
+            adapters: status.adapters.into_iter().map(Into::into).collect(),
+            generations: status.generations.into_iter().map(Into::into).collect(),
+            resident_generations: status.resident_generations,
+            retired_generations: status.retired_generations,
+            resident_bytes: status.resident_bytes,
+            max_adapters: status.limits.max_adapters,
+            max_rank: status.limits.max_rank,
+            max_bytes: status.limits.max_bytes,
+        }
+    }
+}
+
+#[pymethods]
+impl LoraRuntimeStatusPy {
+    fn __repr__(&self) -> String {
+        format!(
+            "LoraRuntimeStatus(adapters={}, resident_generations={}, retired_generations={}, resident_bytes={})",
+            self.adapters.len(),
+            self.resident_generations,
+            self.retired_generations,
+            self.resident_bytes
+        )
+    }
+}
 
 #[cfg(not(feature = "metal"))]
 fn get_device(seed: Option<u64>) -> &'static Result<Device> {
@@ -179,6 +359,54 @@ fn wrap_tool_callbacks(obj: PyObject) -> anyhow::Result<ToolCallbacks> {
         }
         Ok(map)
     })
+}
+
+fn gguf_dynamic_lora_enabled(
+    adapters: Option<&[LoraAdapter]>,
+    runtime_config: LoraRuntimeConfig,
+) -> bool {
+    adapters.is_some() || runtime_config != LoraRuntimeConfig::default()
+}
+
+fn which_uses_dynamic_lora(which: &Which) -> bool {
+    match which {
+        Which::Lora { .. } => true,
+        Which::GGUF {
+            adapters,
+            max_adapters,
+            max_rank,
+            max_bytes,
+            ..
+        } => gguf_dynamic_lora_enabled(
+            adapters.as_deref(),
+            LoraRuntimeConfig {
+                max_adapters: *max_adapters,
+                max_rank: *max_rank,
+                max_bytes: *max_bytes,
+            },
+        ),
+        _ => false,
+    }
+}
+
+fn validate_gguf_runner_options(which: &Which) -> std::result::Result<(), &'static str> {
+    let Which::GGUF {
+        mmproj_filename,
+        auto_map_params,
+        multimodal_auto_map_params,
+        ..
+    } = which
+    else {
+        return Ok(());
+    };
+
+    if auto_map_params.is_some() && multimodal_auto_map_params.is_some() {
+        return Err("GGUF accepts only one of auto_map_params and multimodal_auto_map_params");
+    }
+    if mmproj_filename.is_none() && multimodal_auto_map_params.is_some() {
+        return Err("multimodal_auto_map_params requires mmproj_filename");
+    }
+    Ok(())
 }
 
 fn parse_which(
@@ -305,7 +533,7 @@ fn parse_which(
         Which::Lora {
             model_id,
             tokenizer_json,
-            adapter_model_ids,
+            adapters,
             arch,
             topology,
             write_uqff,
@@ -313,6 +541,9 @@ fn parse_which(
             dtype: _,
             auto_map_params: _,
             hf_cache_path,
+            max_adapters,
+            max_rank,
+            max_bytes,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
@@ -332,31 +563,103 @@ fn parse_which(
             },
             chat_template,
             tokenizer_json,
-            model_id,
+            Some(model_id),
             no_kv_cache,
             jinja_explicit,
         )
-        .with_lora(adapter_model_ids)
+        .with_lora(
+            adapters
+                .unwrap_or_default()
+                .into_iter()
+                .map(|adapter| {
+                    let mut spec = LoraAdapterSpec::new(adapter.alias, adapter.source);
+                    if let Some(revision) = adapter.revision {
+                        spec = spec.with_revision(revision);
+                    }
+                    spec
+                })
+                .collect(),
+            LoraRuntimeConfig {
+                max_adapters,
+                max_rank,
+                max_bytes,
+            },
+        )
         .build(arch.map(Into::into))?,
         Which::GGUF {
             tok_model_id,
             quantized_model_id,
             quantized_filename,
+            tokenizer_json,
+            mmproj_filename,
             topology,
+            organization,
+            write_uqff,
+            imatrix,
+            calibration_file,
+            max_edge,
             dtype: _,
             auto_map_params: _,
-        } => GGUFLoaderBuilder::new(
-            chat_template,
-            tok_model_id,
-            quantized_model_id,
-            quantized_filename.map_left(|f| vec![f]).into_inner(),
-            GGUFSpecificConfig {
-                topology: Topology::from_option_path(topology)?,
-            },
-            no_kv_cache,
-            jinja_explicit,
-        )
-        .build(),
+            multimodal_auto_map_params: _,
+            adapters,
+            max_adapters,
+            max_rank,
+            max_bytes,
+            hf_cache_path,
+            matformer_config_path,
+            matformer_slice_name,
+        } => {
+            let runtime_config = LoraRuntimeConfig {
+                max_adapters,
+                max_rank,
+                max_bytes,
+            };
+            let dynamic_lora = gguf_dynamic_lora_enabled(adapters.as_deref(), runtime_config);
+            let mut builder = GGUFLoaderBuilder::new(
+                chat_template,
+                tok_model_id,
+                quantized_model_id,
+                quantized_filename.map_left(|f| vec![f]).into_inner(),
+                GGUFSpecificConfig {
+                    topology: Topology::from_option_path(topology)?,
+                    organization: organization.map(Into::into).unwrap_or_default(),
+                    write_uqff: write_uqff.map(UqffWriteConfig::from_output),
+                    imatrix,
+                    calibration_file,
+                    max_edge,
+                    max_model_len: None,
+                    hf_cache_path,
+                    matformer_config_path,
+                    matformer_slice_name,
+                },
+                no_kv_cache,
+                jinja_explicit,
+            );
+            if let Some(mmproj_filename) = mmproj_filename {
+                builder = builder
+                    .with_mmproj_files(mmproj_filename.map_left(|file| vec![file]).into_inner());
+            }
+            if let Some(tokenizer_json) = tokenizer_json {
+                builder = builder.with_tokenizer_json(tokenizer_json);
+            }
+            if dynamic_lora {
+                builder = builder.with_dynamic_lora(
+                    adapters
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|adapter| {
+                            let mut spec = LoraAdapterSpec::new(adapter.alias, adapter.source);
+                            if let Some(revision) = adapter.revision {
+                                spec = spec.with_revision(revision);
+                            }
+                            spec
+                        })
+                        .collect(),
+                    runtime_config,
+                );
+            }
+            builder.build()
+        }
         Which::XLoraGGUF {
             tok_model_id,
             quantized_model_id,
@@ -374,6 +677,7 @@ fn parse_which(
             quantized_filename.map_left(|f| vec![f]).into_inner(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                ..Default::default()
             },
             no_kv_cache,
             jinja_explicit,
@@ -404,6 +708,7 @@ fn parse_which(
             quantized_filename.map_left(|f| vec![f]).into_inner(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                ..Default::default()
             },
             no_kv_cache,
             jinja_explicit,
@@ -533,6 +838,7 @@ fn parse_which(
                         .collect::<Vec<_>>()
                 }),
                 max_edge,
+                max_model_len: None,
                 calibration_file,
                 imatrix,
                 hf_cache_path,
@@ -660,6 +966,13 @@ impl Runner {
         code_execution_config: Option<CodeExecutionConfig>,
         shell_config: Option<ShellConfig>,
     ) -> PyApiResult<Self> {
+        let dynamic_lora = which_uses_dynamic_lora(&which);
+        if anymoe_config.is_some() && dynamic_lora {
+            return Err(PyApiErr::from(
+                "dynamic LoRA cannot be combined with AnyMoE in one Python Runner",
+            ));
+        }
+        validate_gguf_runner_options(&which).map_err(PyApiErr::from)?;
         let tgt_non_granular_index = match which {
             Which::Plain { .. }
             | Which::Lora { .. }
@@ -706,9 +1019,6 @@ impl Runner {
             | Which::Lora {
                 auto_map_params, ..
             }
-            | Which::GGUF {
-                auto_map_params, ..
-            }
             | Which::LoraGGUF {
                 auto_map_params, ..
             }
@@ -733,6 +1043,45 @@ impl Runner {
                     max_batch_size: p.max_batch_size,
                 })
                 .unwrap_or(AutoDeviceMapParams::default_text()),
+            Which::GGUF {
+                mmproj_filename,
+                auto_map_params,
+                multimodal_auto_map_params,
+                ..
+            } => {
+                if mmproj_filename.is_some() {
+                    multimodal_auto_map_params
+                        .clone()
+                        .map(|p| AutoDeviceMapParams::Multimodal {
+                            max_seq_len: p.max_seq_len,
+                            max_batch_size: p.max_batch_size,
+                            max_image_shape: (p.max_image_length, p.max_image_length),
+                            max_num_images: p.max_num_images,
+                        })
+                        .or_else(|| {
+                            auto_map_params
+                                .clone()
+                                .map(|p| AutoDeviceMapParams::Multimodal {
+                                    max_seq_len: p.max_seq_len,
+                                    max_batch_size: p.max_batch_size,
+                                    max_image_shape: (
+                                        AutoDeviceMapParams::DEFAULT_MAX_IMAGE_LENGTH,
+                                        AutoDeviceMapParams::DEFAULT_MAX_IMAGE_LENGTH,
+                                    ),
+                                    max_num_images: AutoDeviceMapParams::DEFAULT_MAX_NUM_IMAGES,
+                                })
+                        })
+                        .unwrap_or(AutoDeviceMapParams::default_multimodal())
+                } else {
+                    auto_map_params
+                        .clone()
+                        .map(|p| AutoDeviceMapParams::Text {
+                            max_seq_len: p.max_seq_len,
+                            max_batch_size: p.max_batch_size,
+                        })
+                        .unwrap_or(AutoDeviceMapParams::default_text())
+                }
+            }
             Which::MultimodalPlain {
                 auto_map_params, ..
             } => auto_map_params
@@ -1252,13 +1601,13 @@ impl Runner {
                             audios,
                             videos,
                             enable_thinking: request.enable_thinking,
-                            reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                            reasoning_effort: request.reasoning_effort,
                         }
                     } else {
                         RequestMessage::Chat {
                             messages: messages_vec,
                             enable_thinking: request.enable_thinking,
-                            reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                            reasoning_effort: request.reasoning_effort,
                         }
                     }
                 }
@@ -1274,7 +1623,7 @@ impl Runner {
                     RequestMessage::Chat {
                         messages,
                         enable_thinking: request.enable_thinking,
-                        reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                        reasoning_effort: request.reasoning_effort,
                     }
                 }
             };
@@ -1314,6 +1663,7 @@ impl Runner {
                     repetition_penalty: request.repetition_penalty,
                     max_len: request.max_tokens,
                     stop_toks,
+                    ignore_eos: request.ignore_eos,
                     logits_bias: request.logit_bias.clone(),
                     n_choices: request.n_choices,
                     min_p: request.min_p,
@@ -1341,6 +1691,7 @@ impl Runner {
                 max_tool_rounds: request.max_tool_rounds,
                 tool_dispatch_url: request.tool_dispatch_url.clone(),
                 model_id: model_id.clone(),
+                adapter: request.adapter.clone(),
                 truncate_sequence: request.truncate_sequence,
                 session_id: request.session_id.clone(),
                 files: request
@@ -1436,6 +1787,7 @@ impl Runner {
                         max_tool_rounds: None,
                         tool_dispatch_url: None,
                         model_id: model_id.clone(),
+                        adapter: None,
                         truncate_sequence,
                         session_id: None,
                         files: None,
@@ -1538,6 +1890,7 @@ impl Runner {
                     repetition_penalty: request.repetition_penalty,
                     max_len: request.max_tokens,
                     stop_toks,
+                    ignore_eos: request.ignore_eos,
                     logits_bias: request.logit_bias.clone(),
                     n_choices: request.n_choices,
                     min_p: request.min_p,
@@ -1564,6 +1917,7 @@ impl Runner {
                 max_tool_rounds: None,
                 tool_dispatch_url: None,
                 model_id: model_id.clone(),
+                adapter: request.adapter.clone(),
                 truncate_sequence: request.truncate_sequence,
                 session_id: None,
                 files: None,
@@ -1635,6 +1989,7 @@ impl Runner {
             max_tool_rounds: None,
             tool_dispatch_url: None,
             model_id: model_id.clone(),
+            adapter: None,
             truncate_sequence: false,
             session_id: None,
             files: None,
@@ -1698,6 +2053,7 @@ impl Runner {
             max_tool_rounds: None,
             tool_dispatch_url: None,
             model_id: model_id.clone(),
+            adapter: None,
             truncate_sequence: false,
             session_id: None,
             files: None,
@@ -1732,8 +2088,7 @@ impl Runner {
         })
     }
 
-    /// Send a request to re-ISQ the model. If the model was loaded as GGUF or GGML
-    /// then nothing will happen.
+    /// Re-ISQ a model that was loaded with `in_situ_quant`.
     #[pyo3(signature = (dtype, model_id = None))]
     fn send_re_isq(
         &self,
@@ -2197,13 +2552,13 @@ impl Runner {
                             audios,
                             videos,
                             enable_thinking: request.enable_thinking,
-                            reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                            reasoning_effort: request.reasoning_effort,
                         }
                     } else {
                         RequestMessage::Chat {
                             messages: messages_vec,
                             enable_thinking: request.enable_thinking,
-                            reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                            reasoning_effort: request.reasoning_effort,
                         }
                     }
                 }
@@ -2219,7 +2574,7 @@ impl Runner {
                     RequestMessage::Chat {
                         messages,
                         enable_thinking: request.enable_thinking,
-                        reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                        reasoning_effort: request.reasoning_effort,
                     }
                 }
             };
@@ -2259,6 +2614,7 @@ impl Runner {
                     repetition_penalty: request.repetition_penalty,
                     max_len: request.max_tokens,
                     stop_toks,
+                    ignore_eos: request.ignore_eos,
                     logits_bias: request.logit_bias.clone(),
                     n_choices: request.n_choices,
                     min_p: request.min_p,
@@ -2286,6 +2642,7 @@ impl Runner {
                 max_tool_rounds: request.max_tool_rounds,
                 tool_dispatch_url: request.tool_dispatch_url.clone(),
                 model_id: Some(model_id.clone()),
+                adapter: request.adapter.clone(),
                 truncate_sequence: request.truncate_sequence,
                 session_id: request.session_id.clone(),
                 files: request
@@ -2379,6 +2736,7 @@ impl Runner {
                     repetition_penalty: request.repetition_penalty,
                     max_len: request.max_tokens,
                     stop_toks,
+                    ignore_eos: request.ignore_eos,
                     logits_bias: request.logit_bias.clone(),
                     n_choices: request.n_choices,
                     min_p: request.min_p,
@@ -2405,6 +2763,7 @@ impl Runner {
                 max_tool_rounds: None,
                 tool_dispatch_url: None,
                 model_id: Some(model_id.clone()),
+                adapter: request.adapter.clone(),
                 truncate_sequence: request.truncate_sequence,
                 session_id: None,
                 files: None,
@@ -2441,6 +2800,104 @@ impl Runner {
                 .map_err(|e| e.to_string())
         })
         .map_err(PyApiErr::from)
+    }
+
+    /// Load a local LoRA adapter directory, optionally replacing an existing alias.
+    #[pyo3(signature = (alias, adapter_dir, model_id = None, load_inplace = false, expected_generation = None))]
+    fn load_lora_adapter(
+        &self,
+        py: Python<'_>,
+        alias: String,
+        adapter_dir: PathBuf,
+        model_id: Option<String>,
+        load_inplace: bool,
+        expected_generation: Option<String>,
+    ) -> PyApiResult<LoraAdapterInfoPy> {
+        if expected_generation.is_some() && !load_inplace {
+            return Err(lora_adapter_py_error(
+                "invalid_lora_load_policy",
+                "expected_generation requires load_inplace=True",
+            ));
+        }
+        let policy = match (load_inplace, expected_generation) {
+            (false, None) => LoraAdapterLoadPolicy::Create,
+            (true, None) => LoraAdapterLoadPolicy::Upsert,
+            (true, Some(generation)) => {
+                LoraAdapterLoadPolicy::CompareAndSwap(generation.parse().map_err(
+                    |error: mistralrs_core::AdapterGenerationParseError| {
+                        lora_adapter_py_error("invalid_lora_generation", error.to_string())
+                    },
+                )?)
+            }
+            (false, Some(_)) => unreachable!(),
+        };
+        let runner = self.runner.clone();
+        py.allow_threads(move || {
+            runner.load_lora_adapter_blocking_with_policy(
+                model_id.as_deref(),
+                alias,
+                adapter_dir,
+                policy,
+            )
+        })
+        .map(Into::into)
+        .map_err(lora_adapter_core_py_error)
+    }
+
+    /// Unregister a LoRA alias. In-flight requests keep their generation alive.
+    #[pyo3(signature = (alias, model_id = None, expected_generation = None))]
+    fn unload_lora_adapter(
+        &self,
+        py: Python<'_>,
+        alias: String,
+        model_id: Option<String>,
+        expected_generation: Option<String>,
+    ) -> PyApiResult<LoraAdapterInfoPy> {
+        let expected_generation = expected_generation
+            .map(|generation| {
+                generation
+                    .parse()
+                    .map_err(|error: mistralrs_core::AdapterGenerationParseError| {
+                        lora_adapter_py_error("invalid_lora_generation", error.to_string())
+                    })
+            })
+            .transpose()?;
+        let runner = self.runner.clone();
+        py.allow_threads(move || {
+            runner.unload_lora_adapter_blocking_if_generation(
+                model_id.as_deref(),
+                &alias,
+                expected_generation,
+            )
+        })
+        .map(Into::into)
+        .map_err(lora_adapter_core_py_error)
+    }
+
+    /// List loaded LoRA adapter aliases for a model.
+    #[pyo3(signature = (model_id = None))]
+    fn list_lora_adapters(
+        &self,
+        py: Python<'_>,
+        model_id: Option<String>,
+    ) -> PyApiResult<Vec<LoraAdapterInfoPy>> {
+        let runner = self.runner.clone();
+        py.allow_threads(move || runner.list_lora_adapters_blocking(model_id.as_deref()))
+            .map(|adapters| adapters.into_iter().map(Into::into).collect())
+            .map_err(lora_adapter_core_py_error)
+    }
+
+    /// Return loaded aliases and complete resident-generation capacity usage.
+    #[pyo3(signature = (model_id = None))]
+    fn lora_adapter_status(
+        &self,
+        py: Python<'_>,
+        model_id: Option<String>,
+    ) -> PyApiResult<LoraRuntimeStatusPy> {
+        let runner = self.runner.clone();
+        py.allow_threads(move || runner.lora_adapter_status_blocking(model_id.as_deref()))
+            .map(Into::into)
+            .map_err(lora_adapter_core_py_error)
     }
 
     /// List all unloaded model IDs.
@@ -2703,9 +3160,15 @@ impl From<McpClientConfigPy> for McpClientConfig {
 fn mistralrs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     initialize_logging();
 
+    m.add("LoraAdapterError", m.py().get_type::<LoraAdapterError>())?;
     m.add_class::<Runner>()?;
     m.add_class::<CalibrationStatusPy>()?;
     m.add_class::<Which>()?;
+    m.add_class::<LoraAdapter>()?;
+    m.add_class::<LoraAdapterInfoPy>()?;
+    m.add_class::<LoraResidentGenerationInfoPy>()?;
+    m.add_class::<LoraRuntimeStatusPy>()?;
+    m.add_class::<LoraAdapterGeneration>()?;
     m.add_class::<ChatCompletionRequest>()?;
     m.add_class::<CompletionRequest>()?;
     m.add_class::<EmbeddingRequest>()?;
@@ -2759,4 +3222,100 @@ fn mistralrs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mistralrs_core::WebSearchUserLocation>()?;
     m.add_class::<mistralrs_core::ApproximateUserLocation>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod lora_adapter_error_tests {
+    use super::*;
+
+    fn gguf_which(adapters: Option<Vec<LoraAdapter>>, max_rank: usize) -> Which {
+        Which::GGUF {
+            quantized_model_id: "repo".to_string(),
+            quantized_filename: Either::Left("model.gguf".to_string()),
+            tok_model_id: None,
+            tokenizer_json: None,
+            mmproj_filename: None,
+            topology: None,
+            organization: None,
+            write_uqff: None,
+            imatrix: None,
+            calibration_file: None,
+            max_edge: None,
+            dtype: mistralrs_core::ModelDType::Auto,
+            auto_map_params: None,
+            multimodal_auto_map_params: None,
+            adapters,
+            max_adapters: mistralrs_core::DEFAULT_LORA_MAX_ADAPTERS,
+            max_rank,
+            max_bytes: mistralrs_core::DEFAULT_LORA_MAX_BYTES,
+            hf_cache_path: None,
+            matformer_config_path: None,
+            matformer_slice_name: None,
+        }
+    }
+
+    #[test]
+    fn lifecycle_errors_have_stable_machine_readable_codes() {
+        assert_eq!(
+            lora_adapter_error_code(&MistralRsError::ModelNotFound("model".to_string())),
+            "model_not_found"
+        );
+        assert_eq!(
+            lora_adapter_error_code(&MistralRsError::LoraAdapter(
+                CoreLoraAdapterError::RuntimeUnavailable {
+                    model_id: "model".to_string(),
+                }
+            )),
+            "lora_runtime_unavailable"
+        );
+        assert_eq!(
+            lora_adapter_error_code(&MistralRsError::LoraAdapter(
+                CoreLoraAdapterError::AlreadyLoaded {
+                    alias: "production".to_string(),
+                    generation: mistralrs_core::AdapterGenerationId::from_bytes([1; 32]),
+                }
+            )),
+            "lora_adapter_already_loaded"
+        );
+        assert_eq!(
+            lora_adapter_error_code(&MistralRsError::LoraAdapter(CoreLoraAdapterError::Io {
+                path: PathBuf::from("adapter_model.safetensors"),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })),
+            "adapter_file_not_found"
+        );
+    }
+
+    #[test]
+    fn gguf_dynamic_lora_detection_includes_empty_runtimes_and_custom_limits() {
+        assert!(!which_uses_dynamic_lora(&gguf_which(
+            None,
+            mistralrs_core::DEFAULT_LORA_MAX_RANK,
+        )));
+        assert!(which_uses_dynamic_lora(&gguf_which(
+            Some(Vec::new()),
+            mistralrs_core::DEFAULT_LORA_MAX_RANK,
+        )));
+        assert!(which_uses_dynamic_lora(&gguf_which(
+            None,
+            mistralrs_core::DEFAULT_LORA_MAX_RANK / 2,
+        )));
+    }
+
+    #[test]
+    fn gguf_dynamic_lora_accepts_multimodal_device_mapping() {
+        let mut which = gguf_which(Some(Vec::new()), mistralrs_core::DEFAULT_LORA_MAX_RANK);
+        let Which::GGUF {
+            mmproj_filename,
+            multimodal_auto_map_params,
+            ..
+        } = &mut which
+        else {
+            unreachable!()
+        };
+        *mmproj_filename = Some(Either::Left("mmproj.gguf".to_string()));
+        *multimodal_auto_map_params = Some(which::MultimodalAutoMapParams::new(4096, 1, 1, 1024));
+
+        validate_gguf_runner_options(&which).unwrap();
+    }
 }

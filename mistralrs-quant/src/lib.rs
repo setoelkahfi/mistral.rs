@@ -20,6 +20,9 @@ mod afq;
 mod bitsandbytes;
 mod blockwise_fp8;
 pub mod cublaslt;
+#[cfg(test)]
+#[path = "build_support/cuda_headers.rs"]
+mod cuda_headers;
 #[cfg(all(feature = "cuda", feature = "cutile"))]
 pub mod cutile;
 pub mod distributed;
@@ -47,19 +50,85 @@ mod utils;
 mod vector_fp8;
 
 use gptq::gptq_linear;
-use lora::merge_lora_weights;
 use regex::Regex;
-pub use safetensors::{Shard, ShardedSafeTensors};
+pub use safetensors::{Shard, ShardedSafeTensors, TensorShapes};
 pub use uqff::{
-    build_output_report_from_layers, build_uqff_report, build_uqff_report_from_artifacts,
-    inspect_uqff_artifacts, inspect_uqff_path, stored_type_from_tensors, uqff_version_tensors,
-    verify_uqff_artifacts, verify_uqff_path, write_uqff_report, QuantizationIssue,
-    QuantizationReport, ShardedVarBuilder, TrackedModule, Tracker, UqffArtifactFile,
+    bias_shard, build_output_report_from_layers, build_uqff_report,
+    build_uqff_report_from_artifacts, inspect_uqff_artifacts, inspect_uqff_path, shard_range,
+    slice_blocked_data, stored_type_from_tensors, uqff_version_tensors, verify_uqff_artifacts,
+    verify_uqff_path, write_uqff_report, BiasShard, QuantizationIssue, QuantizationReport,
+    QuantizedExpertKeys, ShardedVarBuilder, TrackedModule, Tracker, UqffArtifactFile,
     UqffArtifactGroup, UqffArtifacts, UqffExpertKeys, UqffFallbackReport, UqffGeneratedBy,
     UqffInspection, UqffLayerReport, UqffMetadataSummary, UqffOutputReport, UqffReader, UqffReport,
     UqffReportOptions, UqffTensor, UqffTensorSummary, UqffVerifyOptions, UqffVerifyResult,
     UQFF_REPORT_JSON, UQFF_VERSION_MAJOR, UQFF_VERSION_MINOR, UQFF_VERSION_PATCH,
 };
+
+pub trait QuantizedWeightSource: Send + Sync {
+    fn contains(&self, name: &str) -> bool;
+
+    fn load_linear(
+        &self,
+        key: &str,
+        device: &Device,
+        shard: Shard,
+    ) -> Result<Option<Arc<dyn QuantMethod>>>;
+
+    fn load_optional_tensor(&self, name: &str, device: &Device) -> Result<Option<Tensor>>;
+
+    fn shard_alignment(&self, key: &str) -> Result<usize>;
+
+    fn pack_factor(&self, dtype: DType) -> Result<usize>;
+
+    fn pack_factor_for(&self, key: &str, dtype: DType) -> Result<Option<usize>>;
+}
+
+impl<T: QuantizedWeightSource + ?Sized> QuantizedWeightSource for Arc<T> {
+    fn contains(&self, name: &str) -> bool {
+        (**self).contains(name)
+    }
+
+    fn load_linear(
+        &self,
+        key: &str,
+        device: &Device,
+        shard: Shard,
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        (**self).load_linear(key, device, shard)
+    }
+
+    fn load_optional_tensor(&self, name: &str, device: &Device) -> Result<Option<Tensor>> {
+        (**self).load_optional_tensor(name, device)
+    }
+
+    fn shard_alignment(&self, key: &str) -> Result<usize> {
+        (**self).shard_alignment(key)
+    }
+
+    fn pack_factor(&self, dtype: DType) -> Result<usize> {
+        (**self).pack_factor(dtype)
+    }
+
+    fn pack_factor_for(&self, key: &str, dtype: DType) -> Result<Option<usize>> {
+        (**self).pack_factor_for(key, dtype)
+    }
+}
+
+/// Bytes the packed-affine (Marlin layout) GGUF weights will occupy on this device.
+///
+/// Subtract from the KV cache budget so the repack is planned for rather than corrected after.
+/// Returns 0 when the feature is off, which is the default.
+pub fn gguf_affine_budget_bytes(device: &Device, dtype: DType) -> usize {
+    #[cfg(all(feature = "cuda", has_marlin_kernels))]
+    {
+        gguf::gguf_affine_budget_bytes(device, dtype)
+    }
+    #[cfg(not(all(feature = "cuda", has_marlin_kernels)))]
+    {
+        let _ = (device, dtype);
+        0
+    }
+}
 
 #[cfg(feature = "metal")]
 pub use afq::ops::{
@@ -85,19 +154,30 @@ pub use fp8::FP8Linear;
 #[cfg(feature = "cuda")]
 pub use gemv::gemv;
 pub use gemv::{should_use_gemv, GEMV_CONTROLLER};
+pub use gguf::archive::{
+    GgufArchive, GgufDType, GgufEndian, GgufShardInfo, GgufTensorData, GgufTensorInfo, GgufVersion,
+};
 pub use gguf::cpu::cpu_indexed_moe_forward;
 #[cfg(feature = "cuda")]
 pub use gguf::cuda::{
     grouped_moe_gemm_prequantized, indexed_moe_fused_decode, moe_dispatch_build,
-    moe_weighted_reduce_flat, moe_weighted_reduce_flat_bf16, quantize_input_q8_1,
+    moe_weighted_reduce_flat, moe_weighted_reduce_flat_bf16, moe_weighted_reduce_flat_same_dtype,
+    quantize_input_q8_1, IndexedMoeLoraDecode, IndexedMoeLoraWeights, IndexedMoeRouting,
     ACT_GELU_PYTORCH_TANH, ACT_SILU,
 };
 #[cfg(feature = "cuda")]
+#[doc(hidden)]
+pub use gguf::fast_mmq::grouped_from_glu_sorted_pair as grouped_moe_mmq_from_glu_sorted_pair;
+#[cfg(feature = "cuda")]
 pub use gguf::fast_mmq::{
-    grouped as grouped_moe_mmq, grouped_from_glu_pair as grouped_moe_mmq_from_glu_pair,
-    grouped_pair as grouped_moe_mmq_pair, supports as supports_mmq,
+    grouped as grouped_moe_mmq, grouped_from_glu_packed as grouped_moe_mmq_from_glu_packed,
+    grouped_from_glu_pair as grouped_moe_mmq_from_glu_pair, grouped_pair as grouped_moe_mmq_pair,
+    grouped_pair_packed as grouped_moe_mmq_pair_packed, supports as supports_mmq,
 };
 pub use gguf::GgufMatMul;
+pub use gguf::{
+    GgufBindingMap, GgufBindingResolver, GgufTensorBackend, GgufTensorBinding, GgufWeightSource,
+};
 pub use gptq::GptqLayer;
 pub use hqq::{HqqAxis, HqqBits, HqqConfig, HqqLayer};
 pub use imatrix::{CollectedImatrixData, ImatrixLayerStats};
@@ -107,8 +187,23 @@ pub use isq_executor::{
     IsqPlanParams, IsqRequest, IsqResourceEstimate,
 };
 pub use lora::{
-    clear_applied_loras, get_applied_loras, linear_no_bias_static_lora, push_applied_lora,
-    LoraAdapter, LoraConfig, StaticLoraConfig, MULTI_LORA_DELIMITER,
+    add_expert_delta_reference, apply_dynamic_lora_delta, has_active_lora_execution,
+    is_dynamic_lora_site_active, linear_no_bias_static_lora, load_dynamic_lora_weights,
+    maybe_wrap_dynamic_lora, plan_dynamic_lora_weights, register_dynamic_lora_site,
+    with_lora_execution, with_lora_execution_repeated_row, with_lora_execution_row_range,
+    DynamicLoraLoadPlan, DynamicLoraWeights, LoraAdapterWeights, LoraConfig, LoraExecution,
+    LoraExecutionArena, LoraExecutionArenaStats, LoraExpertDelta, LoraExpertExecution,
+    LoraExpertInputMode, LoraExpertProjection, LoraExpertProjectionNames,
+    LoraExpertProjectionWeights, LoraExpertSiteHandle, LoraExpertSiteSpec, LoraExpertWeights,
+    LoraGateUpOrder, LoraLayerRegistry, LoraLinearSpec, LoraRuntimeId, LoraSiteHandle, LoraSiteKey,
+    LoraSiteSlice, LoraSlotId, LoraTargetModules, LoraWeights, RoutedLoraAdapterWeight,
+    RoutedLoraInputMode, RoutedLoraMetadataLayout, RoutedLoraProjectionLayout, StaticLoraConfig,
+    ROUTED_LORA_BASE_SLOT, ROUTED_LORA_BLOCK_SIZE, ROUTED_LORA_MAX_RANK, ROUTED_LORA_WMMA_RANK_CAP,
+};
+#[cfg(feature = "cuda")]
+pub use lora::{
+    launch_routed_lora_direct, launch_routed_lora_grouped, RoutedLoraCudaMetadata,
+    RoutedLoraCudaWeightTable, RoutedLoraDirectLaunch, RoutedLoraGroupedLaunch,
 };
 pub use mxfp4::MXFP4Layer;
 pub use pending_layer::{pending_isq_channel, PendingIsqLayer};
@@ -122,11 +217,11 @@ pub use utils::gptoss_swiglu_fused;
 pub use utils::gptoss_swiglu_interleaved;
 pub use utils::isq::{
     apply_immediate_isq, apply_immediate_isq_sharded, apply_immediate_isq_with_key,
-    quantize_expert_stack, requantize_tracked, RequantizeHandles,
+    quantize_expert_stack, quantize_expert_stack_with_bias, requantize_tracked, RequantizeHandles,
 };
 pub use utils::softcap;
 pub use utils::softmax_with_sinks;
-pub use utils::{fused_glu, GluActivationType};
+pub use utils::{fused_glu, fused_split_glu, GluActivationType};
 pub use utils::{log, BitWiseOp, CumSumOp, LeftshiftOp, NonZeroOp, SortOp};
 pub use vector_fp8::{fp8_vector_dequantize, fp8_vector_quantize};
 
@@ -138,9 +233,41 @@ pub struct ImmediateIsqParams {
     pub guard: QuantizeOntoGuard,
     pub ty: Option<IsqType>,
     pub predicates: Vec<Regex>,
+    pub promoted_predicates: Vec<Regex>,
     pub overrides: Vec<ImmediateIsqOverride>,
     pub executor: IsqExecutor,
     pub capture: IsqCaptureMode,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImmediateIsqConfig {
+    pub ty: Option<IsqType>,
+    pub predicates: Vec<Regex>,
+    pub promoted_predicates: Vec<Regex>,
+    pub overrides: Vec<ImmediateIsqOverride>,
+    pub capture: IsqCaptureMode,
+}
+
+impl ImmediateIsqConfig {
+    pub fn new(ty: Option<IsqType>, predicates: Vec<Regex>, capture: IsqCaptureMode) -> Self {
+        Self {
+            ty,
+            predicates,
+            promoted_predicates: Vec::new(),
+            overrides: Vec::new(),
+            capture,
+        }
+    }
+
+    pub fn with_promoted_predicates(mut self, promoted_predicates: Vec<Regex>) -> Self {
+        self.promoted_predicates = promoted_predicates;
+        self
+    }
+
+    pub fn with_overrides(mut self, overrides: Vec<ImmediateIsqOverride>) -> Self {
+        self.overrides = overrides;
+        self
+    }
 }
 
 /// Whether load-time ISQ quantizes layers or captures them unquantized for later quantization.
@@ -193,6 +320,7 @@ pub fn layer_index_from_prefix(prefix: &str) -> Option<usize> {
 pub struct ImmediateIsqMatch {
     pub ty: Option<IsqType>,
     pub device: Option<Device>,
+    pub promote_default: bool,
 }
 
 thread_local! {
@@ -211,14 +339,22 @@ pub fn set_immediate_isq_with_executor(
     capture: IsqCaptureMode,
     executor: IsqExecutor,
 ) {
+    set_immediate_isq_config(
+        ImmediateIsqConfig::new(isq, predicates, capture).with_overrides(overrides),
+        executor,
+    );
+}
+
+pub fn set_immediate_isq_config(config: ImmediateIsqConfig, executor: IsqExecutor) {
     ENGINE_IMMEDIATE_ISQ.with(|cell| {
         *cell.borrow_mut() = Some(ImmediateIsqParams {
             guard: QuantizeOntoGuard::new(),
-            ty: isq,
-            predicates,
-            overrides,
+            ty: config.ty,
+            predicates: config.predicates,
+            promoted_predicates: config.promoted_predicates,
+            overrides: config.overrides,
             executor,
-            capture,
+            capture: config.capture,
         });
     });
 }
@@ -275,6 +411,14 @@ pub fn should_apply_immediate_isq(vb: &ShardedVarBuilder) -> bool {
     immediate_isq_match(vb).is_some()
 }
 
+pub fn weight_source_load_device(vb: &ShardedVarBuilder) -> Device {
+    if should_apply_immediate_isq(vb) {
+        Device::Cpu
+    } else {
+        vb.device().clone()
+    }
+}
+
 pub fn immediate_isq_match(vb: &ShardedVarBuilder) -> Option<ImmediateIsqMatch> {
     let immediate_isq = get_immediate_isq()?;
     // Add a .weight to match the ISQ regexes!
@@ -283,6 +427,17 @@ pub fn immediate_isq_match(vb: &ShardedVarBuilder) -> Option<ImmediateIsqMatch> 
 }
 
 fn resolve_immediate_isq(params: &ImmediateIsqParams, prefix: &str) -> Option<ImmediateIsqMatch> {
+    let promote_default = params
+        .promoted_predicates
+        .iter()
+        .any(|predicate| predicate.is_match(prefix));
+    let default_ty = params.ty.map(|ty| {
+        if promote_default {
+            ty.promote_for_sensitive_tensor()
+        } else {
+            ty
+        }
+    });
     if params.capture == IsqCaptureMode::CaptureAll {
         // Capture everything; topology overrides still pin per-layer ty/device.
         if let Some(override_hit) = params
@@ -291,13 +446,15 @@ fn resolve_immediate_isq(params: &ImmediateIsqParams, prefix: &str) -> Option<Im
             .find(|override_entry| override_entry.matches(prefix))
         {
             return Some(ImmediateIsqMatch {
-                ty: override_hit.ty.or(params.ty),
+                ty: override_hit.ty.or(default_ty),
                 device: override_hit.device.clone(),
+                promote_default,
             });
         }
         return Some(ImmediateIsqMatch {
             ty: None,
             device: None,
+            promote_default,
         });
     }
 
@@ -306,18 +463,19 @@ fn resolve_immediate_isq(params: &ImmediateIsqParams, prefix: &str) -> Option<Im
         .iter()
         .find(|override_entry| override_entry.matches(prefix))
     {
-        let ty = override_hit.ty.or(params.ty);
+        let ty = override_hit.ty.or(default_ty);
         // Device-only overrides still need a match so the layer gets relocated
         if ty.is_some() || override_hit.device.is_some() {
             return Some(ImmediateIsqMatch {
                 ty,
                 device: override_hit.device.clone(),
+                promote_default,
             });
         }
         return None;
     }
 
-    if let Some(ty) = params.ty {
+    if let Some(ty) = default_ty {
         if params
             .predicates
             .iter()
@@ -326,6 +484,7 @@ fn resolve_immediate_isq(params: &ImmediateIsqParams, prefix: &str) -> Option<Im
             return Some(ImmediateIsqMatch {
                 ty: Some(ty),
                 device: None,
+                promote_default,
             });
         }
     }
@@ -456,24 +615,25 @@ impl QuantizedConfig {
 
     pub fn pack_factor(&self, dtype: DType) -> usize {
         match self {
-            Self::GptqAwq { bits, .. } | Self::Afq { bits, .. } => match bits {
+            Self::GptqAwq { bits, .. } => match bits {
                 2 => IsqType::Q2K.pack_factor(dtype),
                 3 => IsqType::Q3K.pack_factor(dtype),
                 4 => IsqType::Q4K.pack_factor(dtype),
                 5 => IsqType::Q5K.pack_factor(dtype),
                 6 => IsqType::Q6K.pack_factor(dtype),
                 8 => IsqType::Q8_0.pack_factor(dtype),
-                40 => 4, // mxfp4: 2 FP4 values per byte = factor of 4
+                40 => IsqType::MXFP4.pack_factor(dtype),
                 other => panic!("Unexpected bits in `pack_factor` {other}"),
             },
-            Self::Fp8 { .. } => IsqType::Q8_0.pack_factor(dtype),
+            Self::Fp8 { .. } => IsqType::F8E4M3.pack_factor(dtype),
             Self::Bitsandbytes {
                 bnb_4bit_quant_type: Some(_),
-            }
-            | Self::Bitsandbytes {
-                bnb_4bit_quant_type: None,
             } => IsqType::Q4K.pack_factor(dtype),
-            Self::MXFP4 {} => IsqType::Q4_0.pack_factor(dtype),
+            Self::Bitsandbytes {
+                bnb_4bit_quant_type: None,
+            } => 1,
+            Self::Afq { bits, group_size } => afq_pack_factor(dtype, *bits, *group_size),
+            Self::MXFP4 {} => IsqType::MXFP4.pack_factor(dtype),
         }
     }
 }
@@ -763,44 +923,96 @@ impl std::fmt::Display for IsqType {
     }
 }
 
+const AFFINE_METADATA_TENSOR_COUNT: usize = 2;
+
+fn integer_pack_factor(dense_bytes: usize, packed_bytes: usize) -> usize {
+    (dense_bytes / packed_bytes.max(1)).max(1)
+}
+
+pub(crate) fn block_pack_factor(block_elements: usize, dtype: DType, packed_bytes: usize) -> usize {
+    let dtype_bytes = dtype.size_in_bytes();
+    let mut factor = integer_pack_factor(block_elements * dtype_bytes, packed_bytes);
+    while factor > 1 && block_elements / factor * dtype_bytes < packed_bytes {
+        factor -= 1;
+    }
+    factor
+}
+
+pub(crate) fn afq_pack_factor(dtype: DType, bits: usize, group_size: usize) -> usize {
+    affine_pack_factor(dtype, bits, group_size, dtype.size_in_bytes())
+}
+
+pub(crate) fn hqq_pack_factor(dtype: DType, bits: usize, group_size: usize) -> usize {
+    affine_pack_factor(dtype, bits, group_size, DType::F32.size_in_bytes())
+}
+
+fn affine_pack_factor(
+    dtype: DType,
+    bits: usize,
+    group_size: usize,
+    metadata_element_bytes: usize,
+) -> usize {
+    let packed_bytes =
+        (group_size * bits).div_ceil(8) + AFFINE_METADATA_TENSOR_COUNT * metadata_element_bytes;
+    block_pack_factor(group_size, dtype, packed_bytes)
+}
+
 impl IsqType {
-    /// Factor by which the weight size is reduced over the given dtype.
-    /// original size / pack factor = quantized size
-    pub fn pack_factor(&self, dtype: DType) -> usize {
+    pub fn promote_for_sensitive_tensor(self) -> Self {
         match self {
-            Self::Q4_0 | Self::AFQ4 => (dtype.size_in_bytes() * GgmlDType::Q4_0.block_size())
-                .div_ceil(GgmlDType::Q4_0.type_size()),
-            Self::Q4_1 => (dtype.size_in_bytes() * GgmlDType::Q4_1.block_size())
-                .div_ceil(GgmlDType::Q4_1.type_size()),
-            Self::Q5_0 => (dtype.size_in_bytes() * GgmlDType::Q5_0.block_size())
-                .div_ceil(GgmlDType::Q5_0.type_size()),
-            Self::Q5_1 => (dtype.size_in_bytes() * GgmlDType::Q5_1.block_size())
-                .div_ceil(GgmlDType::Q5_1.type_size()),
-            Self::Q8_0 | Self::AFQ8 => (dtype.size_in_bytes() * GgmlDType::Q8_0.block_size())
-                .div_ceil(GgmlDType::Q8_0.type_size()),
-            Self::Q8_1 => (dtype.size_in_bytes() * GgmlDType::Q8_1.block_size())
-                .div_ceil(GgmlDType::Q8_1.type_size()),
-            Self::Q2K | Self::AFQ2 => (dtype.size_in_bytes() * GgmlDType::Q2K.block_size())
-                .div_ceil(GgmlDType::Q2K.type_size()),
-            Self::Q3K | Self::AFQ3 => (dtype.size_in_bytes() * GgmlDType::Q3K.block_size())
-                .div_ceil(GgmlDType::Q3K.type_size()),
-            Self::Q4K => (dtype.size_in_bytes() * GgmlDType::Q4K.block_size())
-                .div_ceil(GgmlDType::Q4K.type_size()),
-            Self::Q5K => (dtype.size_in_bytes() * GgmlDType::Q5K.block_size())
-                .div_ceil(GgmlDType::Q5K.type_size()),
-            Self::Q6K | Self::AFQ6 => (dtype.size_in_bytes() * GgmlDType::Q6K.block_size())
-                .div_ceil(GgmlDType::Q6K.type_size()),
-            Self::Q8K => (dtype.size_in_bytes() * GgmlDType::Q8K.block_size())
-                .div_ceil(GgmlDType::Q8K.type_size()),
-            // F8Q8: 33 bytes per 32 values -> similar to Q8_0
-            Self::F8Q8 => (dtype.size_in_bytes() * 32).div_ceil(33),
-            // Estimates
-            Self::HQQ4 => 4,
-            Self::HQQ8 => 2,
-            Self::F8E4M3 => 2,
-            // MXFP4: 4 bits per value + 1 byte scale per 32 values
-            // For BF16 (2 bytes): (2*32)/(16+1) ≈ 3.76 → 3
-            Self::MXFP4 => 3,
+            Self::AFQ2 | Self::AFQ3 | Self::AFQ4 => Self::AFQ6,
+            Self::AFQ6 | Self::AFQ8 => Self::AFQ8,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q4_0 | Self::Q4_1 => Self::Q6K,
+            Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q8_1 => Self::Q8_0,
+            ty => ty,
+        }
+    }
+
+    /// Integer factor used to estimate the weight-size reduction over the given dtype.
+    pub fn pack_factor(&self, dtype: DType) -> usize {
+        let ggml = |quantized_dtype: GgmlDType| {
+            block_pack_factor(
+                quantized_dtype.block_size(),
+                dtype,
+                quantized_dtype.type_size(),
+            )
+        };
+        match self {
+            Self::Q4_0 => ggml(GgmlDType::Q4_0),
+            Self::Q4_1 => ggml(GgmlDType::Q4_1),
+            Self::Q5_0 => ggml(GgmlDType::Q5_0),
+            Self::Q5_1 => ggml(GgmlDType::Q5_1),
+            Self::Q8_0 => ggml(GgmlDType::Q8_0),
+            Self::Q8_1 => ggml(GgmlDType::Q8_1),
+            Self::Q2K => ggml(GgmlDType::Q2K),
+            Self::Q3K => ggml(GgmlDType::Q3K),
+            Self::Q4K => ggml(GgmlDType::Q4K),
+            Self::Q5K => ggml(GgmlDType::Q5K),
+            Self::Q6K => ggml(GgmlDType::Q6K),
+            Self::Q8K => ggml(GgmlDType::Q8K),
+            Self::AFQ2 => afq_pack_factor(dtype, 2, AfqGroupSize::Low as usize),
+            Self::AFQ3 => afq_pack_factor(dtype, 3, AfqGroupSize::Low as usize),
+            Self::AFQ4 => afq_pack_factor(dtype, 4, AfqGroupSize::Low as usize),
+            Self::AFQ6 => afq_pack_factor(dtype, 6, AfqGroupSize::Low as usize),
+            Self::AFQ8 => afq_pack_factor(dtype, 8, AfqGroupSize::Low as usize),
+            Self::F8Q8 => {
+                block_pack_factor(f8q8::QK8_0, dtype, std::mem::size_of::<f8q8::BlockF8Q8>())
+            }
+            Self::HQQ4 => hqq_pack_factor(dtype, 4, hqq::ISQ_HQQ_GROUP_SIZE),
+            Self::HQQ8 => hqq_pack_factor(dtype, 8, hqq::ISQ_HQQ_GROUP_SIZE),
+            Self::F8E4M3 => 1,
+            Self::MXFP4 => block_pack_factor(
+                mxfp4::MXFP4_BLOCK_SIZE,
+                dtype,
+                mxfp4::MXFP4_BLOCK_SIZE * mxfp4::N_BITS / u8::BITS as usize
+                    + DType::U8.size_in_bytes(),
+            ),
         }
     }
 
@@ -838,6 +1050,14 @@ impl IsqType {
                 | Self::F8Q8
                 | Self::MXFP4
         )
+    }
+
+    pub fn supports_stacked_gather(self) -> bool {
+        GgmlDType::try_from(self).is_ok()
+            || matches!(
+                self,
+                Self::AFQ2 | Self::AFQ3 | Self::AFQ4 | Self::AFQ6 | Self::AFQ8
+            )
     }
 
     pub fn get_max_isq_cpu_threads(&self) -> Option<NonZeroUsize> {
@@ -1041,6 +1261,9 @@ pub trait QuantizedSerde {
     fn isq_serde_supported(&self) -> bool {
         false
     }
+    fn uqff_type(&self) -> Option<IsqType> {
+        None
+    }
     fn serialize_uqff(&self, _prefix: &str, ty: IsqType) -> Result<Vec<UqffTensor>> {
         candle_core::bail!(
             "`{}` does not support UQFF serialization for {ty}.",
@@ -1210,10 +1433,38 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
         )
     }
 
+    fn embedding_forward(&self, ids: &Tensor, output_dtype: DType) -> Result<Tensor> {
+        self.embedding_forward_raw(ids)?.to_dtype(output_dtype)
+    }
+
+    fn embedding_forward_raw(&self, _ids: &Tensor) -> Result<Tensor> {
+        candle_core::bail!(
+            "{} does not support `embedding_forward`. Please raise an issue.",
+            self.name()
+        )
+    }
+
     /// Get the underlying QTensor if this is a GGUF quantized layer.
     /// Used for direct kernel access in grouped MoE prefill and CPU fused GEMV paths.
     fn get_qtensor(&self) -> Option<Arc<candle_core::quantized::QTensor>> {
         None
+    }
+
+    #[cfg(all(feature = "cuda", has_marlin_kernels))]
+    #[doc(hidden)]
+    fn prepare_gguf_affine_raw(
+        &self,
+        _flat_batch: usize,
+        _dtype: DType,
+        _device: &Device,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(all(feature = "cuda", has_marlin_kernels))]
+    #[doc(hidden)]
+    fn try_gguf_affine_forward_raw(&self, _a: &Tensor) -> Result<Option<Tensor>> {
+        Ok(None)
     }
 
     /// If this is an AFQ layer, return its (w_q, scales, biases, bits, group_size).
@@ -1245,6 +1496,14 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
 
     fn unquant_weight_bias(&self) -> Option<(Tensor, Option<Tensor>)> {
         None
+    }
+
+    fn is_dynamic_lora_active(&self) -> bool {
+        false
+    }
+
+    fn preserve_dynamic_lora(&self, replacement: Arc<dyn QuantMethod>) -> Arc<dyn QuantMethod> {
+        replacement
     }
 
     fn has_bias(&self) -> bool {
@@ -1288,6 +1547,104 @@ impl Module for dyn QuantMethod {
 }
 
 #[cfg(feature = "cuda")]
+pub fn try_fused_quantized_ffn(
+    xs: &Tensor,
+    gate: &dyn QuantMethod,
+    up: &dyn QuantMethod,
+    down: &dyn QuantMethod,
+    activation: GluActivationType,
+) -> Result<Option<Tensor>> {
+    if !xs.device().is_cuda() {
+        return Ok(None);
+    }
+    if gate.stats_snapshot().is_some()
+        || up.stats_snapshot().is_some()
+        || down.stats_snapshot().is_some()
+    {
+        return Ok(None);
+    }
+    if gate.is_dynamic_lora_active() || up.is_dynamic_lora_active() || down.is_dynamic_lora_active()
+    {
+        return Ok(None);
+    }
+    if gate.has_bias() || up.has_bias() || down.has_bias() {
+        return Ok(None);
+    }
+    if !matches!(xs.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+        return Ok(None);
+    }
+
+    let (flat_batch, k) = match xs.dims() {
+        [batch, k] => (*batch, *k),
+        [batch, rows, k] => (*batch * *rows, *k),
+        _ => return Ok(None),
+    };
+    if flat_batch < gguf::GGUF_AFFINE_MIN_BATCH {
+        return Ok(None);
+    }
+
+    let Some(gate_q) = gate.get_qtensor() else {
+        return Ok(None);
+    };
+    let Some(up_q) = up.get_qtensor() else {
+        return Ok(None);
+    };
+    let Some(down_q) = down.get_qtensor() else {
+        return Ok(None);
+    };
+    if gate_q.shape() != up_q.shape() {
+        return Ok(None);
+    }
+    let (intermediate, gate_cols) = gate_q.shape().dims2()?;
+    let (_, down_cols) = down_q.shape().dims2()?;
+    if gate_cols != k || down_cols != intermediate {
+        return Ok(None);
+    }
+    if !gate_q.device().same_device(xs.device())
+        || !up_q.device().same_device(xs.device())
+        || !down_q.device().same_device(xs.device())
+    {
+        return Ok(None);
+    }
+
+    #[cfg(has_marlin_kernels)]
+    {
+        let gate_ready = gate.prepare_gguf_affine_raw(flat_batch, xs.dtype(), xs.device())?;
+        let up_ready = up.prepare_gguf_affine_raw(flat_batch, xs.dtype(), xs.device())?;
+        let down_ready = down.prepare_gguf_affine_raw(flat_batch, xs.dtype(), xs.device())?;
+        if gate_ready && up_ready && down_ready {
+            let gate_out = gate
+                .try_gguf_affine_forward_raw(xs)?
+                .expect("prepared GGUF affine gate projection");
+            let up_out = up
+                .try_gguf_affine_forward_raw(xs)?
+                .expect("prepared GGUF affine up projection");
+            let intermediate = fused_glu(&gate_out, &up_out, activation)?;
+            drop(gate_out);
+            drop(up_out);
+            let out = down
+                .try_gguf_affine_forward_raw(&intermediate)?
+                .expect("prepared GGUF affine down projection");
+            return Ok(Some(out));
+        }
+    }
+
+    if flat_batch <= gguf::fast_mmvq::MMVQ_MAX_BATCH {
+        return Ok(None);
+    }
+    if gate_q.dtype() != up_q.dtype()
+        || !gguf::fast_mmq::supports(gate_q.dtype())
+        || !gguf::fast_mmq::supports(down_q.dtype())
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(gguf::fast_mmq::fused_ffn(
+        &gate_q, &up_q, &down_q, xs, activation,
+    )?))
+}
+
+#[cfg(feature = "cuda")]
 pub fn try_fused_quantized_gate_up(
     xs: &Tensor,
     gate: &dyn QuantMethod,
@@ -1295,6 +1652,12 @@ pub fn try_fused_quantized_gate_up(
     activation: GluActivationType,
 ) -> Result<Option<Tensor>> {
     if !xs.device().is_cuda() {
+        return Ok(None);
+    }
+    if gate.stats_snapshot().is_some() || up.stats_snapshot().is_some() {
+        return Ok(None);
+    }
+    if gate.is_dynamic_lora_active() || up.is_dynamic_lora_active() {
         return Ok(None);
     }
     if gate.has_bias() || up.has_bias() {
@@ -1310,12 +1673,6 @@ pub fn try_fused_quantized_gate_up(
     let Some(up_q) = up.get_qtensor() else {
         return Ok(None);
     };
-    if gate_q.dtype() != up_q.dtype() {
-        return Ok(None);
-    }
-    if !gguf::fast_mmvq::supports_fused_glu(xs.dtype(), gate_q.dtype()) {
-        return Ok(None);
-    }
     if gate_q.shape() != up_q.shape() {
         return Ok(None);
     }
@@ -1324,7 +1681,7 @@ pub fn try_fused_quantized_gate_up(
         return Ok(None);
     };
     let flat_batch = batch_dims.iter().product::<usize>();
-    if flat_batch == 0 || flat_batch > gguf::fast_mmvq::MMVQ_MAX_BATCH {
+    if flat_batch == 0 {
         return Ok(None);
     }
     let (_, ncols) = gate_q.shape().dims2()?;
@@ -1332,9 +1689,39 @@ pub fn try_fused_quantized_gate_up(
         return Ok(None);
     }
 
-    Ok(Some(gguf::fast_mmvq::fused_glu(
-        &gate_q, &up_q, xs, activation,
-    )?))
+    #[cfg(has_marlin_kernels)]
+    if flat_batch >= gguf::GGUF_AFFINE_MIN_BATCH {
+        let gate_ready = gate.prepare_gguf_affine_raw(flat_batch, xs.dtype(), xs.device())?;
+        let up_ready = up.prepare_gguf_affine_raw(flat_batch, xs.dtype(), xs.device())?;
+        if gate_ready && up_ready {
+            let gate_out = gate
+                .try_gguf_affine_forward_raw(xs)?
+                .expect("prepared GGUF affine gate projection");
+            let up_out = up
+                .try_gguf_affine_forward_raw(xs)?
+                .expect("prepared GGUF affine up projection");
+            return Ok(Some(fused_glu(&gate_out, &up_out, activation)?));
+        }
+    }
+
+    if gate_q.dtype() != up_q.dtype() {
+        return Ok(None);
+    }
+    if flat_batch <= gguf::fast_mmvq::MMVQ_MAX_BATCH {
+        if !gguf::fast_mmvq::supports_fused_glu(xs.dtype(), gate_q.dtype()) {
+            return Ok(None);
+        }
+        Ok(Some(gguf::fast_mmvq::fused_glu(
+            &gate_q, &up_q, xs, activation,
+        )?))
+    } else {
+        if !gguf::fast_mmq::supports(gate_q.dtype()) {
+            return Ok(None);
+        }
+        Ok(Some(gguf::fast_mmq::fused_glu(
+            &gate_q, &up_q, xs, activation,
+        )?))
+    }
 }
 
 /// CPU fused m==1 matmuls sharing one lhs: one input quantization + one parallel region
@@ -1370,6 +1757,13 @@ pub fn try_fused_quantized_qkv(
     if !xs.device().is_cuda() {
         return Ok(None);
     }
+    if q.stats_snapshot().is_some() || k.stats_snapshot().is_some() || v.stats_snapshot().is_some()
+    {
+        return Ok(None);
+    }
+    if q.is_dynamic_lora_active() || k.is_dynamic_lora_active() || v.is_dynamic_lora_active() {
+        return Ok(None);
+    }
     if q.has_bias() || k.has_bias() || v.has_bias() {
         return Ok(None);
     }
@@ -1386,16 +1780,12 @@ pub fn try_fused_quantized_qkv(
     let Some(v_q) = v.get_qtensor() else {
         return Ok(None);
     };
-    let dtype = q_q.dtype();
-    if dtype != k_q.dtype() || dtype != v_q.dtype() || !gguf::fast_mmvq::supports(dtype) {
-        return Ok(None);
-    }
 
     let Some((&input_cols, batch_dims)) = xs.dims().split_last() else {
         return Ok(None);
     };
     let flat_batch = batch_dims.iter().product::<usize>();
-    if flat_batch == 0 || flat_batch > gguf::fast_mmvq::MMVQ_MAX_BATCH {
+    if flat_batch == 0 {
         return Ok(None);
     }
     let (_, q_cols) = q_q.shape().dims2()?;
@@ -1405,7 +1795,40 @@ pub fn try_fused_quantized_qkv(
         return Ok(None);
     }
 
-    Ok(Some(gguf::fast_mmvq::fused_qkv(&q_q, &k_q, &v_q, xs)?))
+    #[cfg(has_marlin_kernels)]
+    if flat_batch >= gguf::GGUF_AFFINE_MIN_BATCH {
+        let q_ready = q.prepare_gguf_affine_raw(flat_batch, xs.dtype(), xs.device())?;
+        let k_ready = k.prepare_gguf_affine_raw(flat_batch, xs.dtype(), xs.device())?;
+        let v_ready = v.prepare_gguf_affine_raw(flat_batch, xs.dtype(), xs.device())?;
+        if q_ready && k_ready && v_ready {
+            let q_out = q
+                .try_gguf_affine_forward_raw(xs)?
+                .expect("prepared GGUF affine query projection");
+            let k_out = k
+                .try_gguf_affine_forward_raw(xs)?
+                .expect("prepared GGUF affine key projection");
+            let v_out = v
+                .try_gguf_affine_forward_raw(xs)?
+                .expect("prepared GGUF affine value projection");
+            return Ok(Some((q_out, k_out, v_out)));
+        }
+    }
+
+    let dtype = q_q.dtype();
+    if dtype != k_q.dtype() || dtype != v_q.dtype() {
+        return Ok(None);
+    }
+    if flat_batch <= gguf::fast_mmvq::MMVQ_MAX_BATCH {
+        if !gguf::fast_mmvq::supports(dtype) {
+            return Ok(None);
+        }
+        Ok(Some(gguf::fast_mmvq::fused_qkv(&q_q, &k_q, &v_q, xs)?))
+    } else {
+        if !gguf::fast_mmq::supports(dtype) {
+            return Ok(None);
+        }
+        Ok(Some(gguf::fast_mmq::fused_qkv(&q_q, &k_q, &v_q, xs)?))
+    }
 }
 
 /// Metal fused gate+up: single Metal kernel that does both matmuls with shared
@@ -1516,7 +1939,7 @@ pub fn try_fused_gate_up_metal(
     metal_kernels::call_afq_qmm_gate_up(
         device.device(),
         &encoder,
-        &metal_kernels::Kernels::new(),
+        metal_kernels::Kernels::global(),
         dtype,
         (
             xs_storage.buffer(),
@@ -1659,7 +2082,7 @@ pub fn try_fused_qkv_metal(
     metal_kernels::call_afq_qmm_qkv(
         device.device(),
         &encoder,
-        &metal_kernels::Kernels::new(),
+        metal_kernels::Kernels::global(),
         dtype,
         (xs_s.buffer(), xs_l.start_offset() * dtype.size_in_bytes()),
         qw_m.buffer(),
@@ -1773,13 +2196,17 @@ pub fn linear_no_bias(
     vb: ShardedVarBuilder,
 ) -> Result<Arc<dyn QuantMethod>> {
     let base_vb = vb.clone();
-    if config.is_none() {
-        if let Some(reader) = base_vb.uqff_reader() {
-            if let Some(layer) =
-                reader.load_linear(&base_vb.prefix(), base_vb.device(), Shard::default())?
-            {
-                return Ok(layer);
-            }
+    if let Some(source) = base_vb.weight_source() {
+        let load_device = weight_source_load_device(&base_vb);
+        if let Some(layer) =
+            source.load_linear(&base_vb.prefix(), &load_device, Shard::default())?
+        {
+            let layer = maybe_wrap_dynamic_lora(
+                &base_vb,
+                layer,
+                LoraLinearSpec::replicated(in_dim, out_dim),
+            )?;
+            return apply_immediate_isq_sharded(layer, base_vb, Some(Shard::default()));
         }
     }
     let vb = if should_apply_immediate_isq(&vb) {
@@ -1788,7 +2215,6 @@ pub fn linear_no_bias(
         vb
     };
 
-    let mut lora_merged = false;
     let layer = if let Some(quant_conf) = &config {
         match quant_conf {
             QuantizedConfig::GptqAwq { .. } => gptq_linear(in_dim, out_dim, quant_conf, vb)?,
@@ -1828,9 +2254,6 @@ pub fn linear_no_bias(
             make_dummy_or_error("linear_no_bias", &vb, &["weight"])?
         } else {
             let weight = vb.get_with_hints((out_dim, in_dim), "weight", Default::default())?;
-            let (weight, merged) =
-                merge_lora_weights(&vb, weight, in_dim, out_dim, Default::default())?;
-            lora_merged = merged;
 
             let layer = <UnquantLinear as QuantMethod>::new(QuantMethodConfig::Unquantized(
                 Linear::new(weight, None),
@@ -1838,13 +2261,9 @@ pub fn linear_no_bias(
             Arc::new(layer) as Arc<dyn QuantMethod>
         }
     };
-    // merged weights diverge from the source checkpoint; no shard means no from-source requant
-    let tracked_shard = if lora_merged {
-        None
-    } else {
-        Some(Shard::default())
-    };
-    apply_immediate_isq_sharded(layer, base_vb, tracked_shard)
+    let layer =
+        maybe_wrap_dynamic_lora(&base_vb, layer, LoraLinearSpec::replicated(in_dim, out_dim))?;
+    apply_immediate_isq_sharded(layer, base_vb, Some(Shard::default()))
 }
 
 pub fn linear(
@@ -1854,13 +2273,17 @@ pub fn linear(
     vb: ShardedVarBuilder,
 ) -> Result<Arc<dyn QuantMethod>> {
     let base_vb = vb.clone();
-    if config.is_none() {
-        if let Some(reader) = base_vb.uqff_reader() {
-            if let Some(layer) =
-                reader.load_linear(&base_vb.prefix(), base_vb.device(), Shard::default())?
-            {
-                return Ok(layer);
-            }
+    if let Some(source) = base_vb.weight_source() {
+        let load_device = weight_source_load_device(&base_vb);
+        if let Some(layer) =
+            source.load_linear(&base_vb.prefix(), &load_device, Shard::default())?
+        {
+            let layer = maybe_wrap_dynamic_lora(
+                &base_vb,
+                layer,
+                LoraLinearSpec::replicated(in_dim, out_dim),
+            )?;
+            return apply_immediate_isq_sharded(layer, base_vb, Some(Shard::default()));
         }
     }
     let vb = if should_apply_immediate_isq(&vb) {
@@ -1869,7 +2292,6 @@ pub fn linear(
         vb
     };
 
-    let mut lora_merged = false;
     let layer = if let Some(quant_conf) = &config {
         match quant_conf {
             QuantizedConfig::GptqAwq { .. } => gptq_linear(in_dim, out_dim, quant_conf, vb)?,
@@ -1909,9 +2331,6 @@ pub fn linear(
             make_dummy_or_error("linear", &vb, &["weight", "bias"])?
         } else {
             let weight = vb.get_with_hints((out_dim, in_dim), "weight", Default::default())?;
-            let (weight, merged) =
-                merge_lora_weights(&vb, weight, in_dim, out_dim, Default::default())?;
-            lora_merged = merged;
             let bias = vb.get_with_hints((out_dim,), "bias", Default::default())?;
 
             let layer = <UnquantLinear as QuantMethod>::new(QuantMethodConfig::Unquantized(
@@ -1920,13 +2339,9 @@ pub fn linear(
             Arc::new(layer) as Arc<dyn QuantMethod>
         }
     };
-    // merged weights diverge from the source checkpoint; no shard means no from-source requant
-    let tracked_shard = if lora_merged {
-        None
-    } else {
-        Some(Shard::default())
-    };
-    apply_immediate_isq_sharded(layer, base_vb, tracked_shard)
+    let layer =
+        maybe_wrap_dynamic_lora(&base_vb, layer, LoraLinearSpec::replicated(in_dim, out_dim))?;
+    apply_immediate_isq_sharded(layer, base_vb, Some(Shard::default()))
 }
 
 pub fn linear_b(
@@ -1949,6 +2364,89 @@ mod tests {
 
     use super::*;
 
+    struct DenseWeightSource;
+
+    impl QuantizedWeightSource for DenseWeightSource {
+        fn contains(&self, name: &str) -> bool {
+            name == "foo.weight"
+        }
+
+        fn load_linear(
+            &self,
+            key: &str,
+            device: &Device,
+            _shard: Shard,
+        ) -> Result<Option<Arc<dyn QuantMethod>>> {
+            if key != "foo" {
+                return Ok(None);
+            }
+            let weight = Tensor::zeros((3, 2), DType::F32, device)?;
+            Ok(Some(Arc::new(UnquantLinear::new(
+                QuantMethodConfig::Unquantized(Linear::new(weight, None)),
+            )?)))
+        }
+
+        fn load_optional_tensor(&self, _name: &str, _device: &Device) -> Result<Option<Tensor>> {
+            Ok(None)
+        }
+
+        fn shard_alignment(&self, _key: &str) -> Result<usize> {
+            Ok(1)
+        }
+
+        fn pack_factor(&self, _dtype: DType) -> Result<usize> {
+            Ok(1)
+        }
+
+        fn pack_factor_for(&self, _key: &str, _dtype: DType) -> Result<Option<usize>> {
+            Ok(Some(1))
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    struct RecordingWeightSource {
+        load_devices: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    #[cfg(feature = "cuda")]
+    impl QuantizedWeightSource for RecordingWeightSource {
+        fn contains(&self, name: &str) -> bool {
+            name == "foo.weight"
+        }
+
+        fn load_linear(
+            &self,
+            key: &str,
+            device: &Device,
+            _shard: Shard,
+        ) -> Result<Option<Arc<dyn QuantMethod>>> {
+            if key != "foo" {
+                return Ok(None);
+            }
+            self.load_devices.lock().unwrap().push(device.is_cpu());
+            let weight = Tensor::zeros((3, 2), DType::F32, device)?;
+            Ok(Some(Arc::new(UnquantLinear::new(
+                QuantMethodConfig::Unquantized(Linear::new(weight, None)),
+            )?)))
+        }
+
+        fn load_optional_tensor(&self, _name: &str, _device: &Device) -> Result<Option<Tensor>> {
+            Ok(None)
+        }
+
+        fn shard_alignment(&self, _key: &str) -> Result<usize> {
+            Ok(1)
+        }
+
+        fn pack_factor(&self, _dtype: DType) -> Result<usize> {
+            Ok(1)
+        }
+
+        fn pack_factor_for(&self, _key: &str, _dtype: DType) -> Result<Option<usize>> {
+            Ok(Some(1))
+        }
+    }
+
     fn empty_vb(make_dummy_regexes: Option<Vec<&str>>) -> ShardedVarBuilder {
         let backend: HashMap<String, Tensor> = HashMap::new();
         let make_dummy_regexes = make_dummy_regexes.map(|regexes| {
@@ -1966,6 +2464,262 @@ mod tests {
             Device::Cpu,
             make_dummy_regexes,
         )
+    }
+
+    fn immediate_params(
+        ty: Option<IsqType>,
+        overrides: Vec<ImmediateIsqOverride>,
+    ) -> ImmediateIsqParams {
+        let (executor, _) = create_isq_executor(IsqExecutorConfig::new(ty));
+        ImmediateIsqParams {
+            guard: QuantizeOntoGuard::new(),
+            ty,
+            predicates: vec![Regex::new(r"\.weight$").unwrap()],
+            promoted_predicates: vec![
+                Regex::new(r"^model\.embed_tokens\.(?:weight|bias)$").unwrap()
+            ],
+            overrides,
+            executor,
+            capture: IsqCaptureMode::Immediate,
+        }
+    }
+
+    #[test]
+    fn sensitive_tensor_policy_promotes_expected_types() {
+        for ty in [IsqType::AFQ2, IsqType::AFQ3, IsqType::AFQ4] {
+            assert_eq!(ty.promote_for_sensitive_tensor(), IsqType::AFQ6);
+        }
+        for ty in [IsqType::AFQ6, IsqType::AFQ8] {
+            assert_eq!(ty.promote_for_sensitive_tensor(), IsqType::AFQ8);
+        }
+        for ty in [
+            IsqType::Q2K,
+            IsqType::Q3K,
+            IsqType::Q4K,
+            IsqType::Q4_0,
+            IsqType::Q4_1,
+        ] {
+            assert_eq!(ty.promote_for_sensitive_tensor(), IsqType::Q6K);
+        }
+        for ty in [
+            IsqType::Q5K,
+            IsqType::Q6K,
+            IsqType::Q8K,
+            IsqType::Q5_0,
+            IsqType::Q5_1,
+            IsqType::Q8_0,
+            IsqType::Q8_1,
+        ] {
+            assert_eq!(ty.promote_for_sensitive_tensor(), IsqType::Q8_0);
+        }
+        assert_eq!(IsqType::HQQ4.promote_for_sensitive_tensor(), IsqType::HQQ4);
+    }
+
+    #[test]
+    fn ggml_pack_factor_uses_a_safe_integer_lower_bound() {
+        let dtype = DType::BF16;
+        let cases = [
+            (IsqType::Q4K, GgmlDType::Q4K, 512, 144, 4, 128, 3, 170),
+            (IsqType::Q6K, GgmlDType::Q6K, 512, 210, 3, 170, 2, 256),
+            (IsqType::Q8_0, GgmlDType::Q8_0, 64, 34, 2, 32, 1, 64),
+        ];
+
+        for (
+            ty,
+            quantized_dtype,
+            dense_bytes,
+            packed_bytes,
+            ceil_factor,
+            ceil_bytes,
+            factor,
+            bytes,
+        ) in cases
+        {
+            let actual_dense_bytes = dtype.size_in_bytes() * quantized_dtype.block_size();
+            let actual_packed_bytes = quantized_dtype.type_size();
+            assert_eq!(actual_dense_bytes, dense_bytes);
+            assert_eq!(actual_packed_bytes, packed_bytes);
+            assert_eq!(
+                actual_dense_bytes.div_ceil(actual_packed_bytes),
+                ceil_factor
+            );
+            assert_eq!(actual_dense_bytes / ceil_factor, ceil_bytes);
+            assert!(ceil_bytes < actual_packed_bytes);
+            assert_eq!(ty.pack_factor(dtype), factor);
+            assert_eq!(actual_dense_bytes / factor, bytes);
+            assert!(bytes >= actual_packed_bytes);
+        }
+    }
+
+    #[test]
+    fn ggml_and_f8q8_pack_factors_never_undercount_block_storage() {
+        let ggml_types = [
+            (IsqType::Q4_0, GgmlDType::Q4_0),
+            (IsqType::Q4_1, GgmlDType::Q4_1),
+            (IsqType::Q5_0, GgmlDType::Q5_0),
+            (IsqType::Q5_1, GgmlDType::Q5_1),
+            (IsqType::Q8_0, GgmlDType::Q8_0),
+            (IsqType::Q8_1, GgmlDType::Q8_1),
+            (IsqType::Q2K, GgmlDType::Q2K),
+            (IsqType::Q3K, GgmlDType::Q3K),
+            (IsqType::Q4K, GgmlDType::Q4K),
+            (IsqType::Q5K, GgmlDType::Q5K),
+            (IsqType::Q6K, GgmlDType::Q6K),
+            (IsqType::Q8K, GgmlDType::Q8K),
+        ];
+
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            for (ty, quantized_dtype) in ggml_types {
+                let estimated_bytes =
+                    quantized_dtype.block_size() / ty.pack_factor(dtype) * dtype.size_in_bytes();
+                assert!(estimated_bytes >= quantized_dtype.type_size());
+            }
+
+            let f8q8_bytes = f8q8::QK8_0 / IsqType::F8Q8.pack_factor(dtype) * dtype.size_in_bytes();
+            assert!(f8q8_bytes >= std::mem::size_of::<f8q8::BlockF8Q8>());
+
+            let mxfp4_bytes =
+                mxfp4::MXFP4_BLOCK_SIZE / IsqType::MXFP4.pack_factor(dtype) * dtype.size_in_bytes();
+            let packed_mxfp4_bytes = mxfp4::MXFP4_BLOCK_SIZE * mxfp4::N_BITS / u8::BITS as usize
+                + DType::U8.size_in_bytes();
+            assert!(mxfp4_bytes >= packed_mxfp4_bytes);
+        }
+    }
+
+    #[test]
+    fn affine_pack_factors_include_group_metadata() {
+        let afq_types = [
+            (IsqType::AFQ2, 2),
+            (IsqType::AFQ3, 3),
+            (IsqType::AFQ4, 4),
+            (IsqType::AFQ6, 6),
+            (IsqType::AFQ8, 8),
+        ];
+        for (dtype, expected) in [
+            (DType::F16, [5, 4, 3, 2, 1]),
+            (DType::BF16, [5, 4, 3, 2, 1]),
+            (DType::F32, [8, 6, 5, 4, 3]),
+        ] {
+            for ((ty, bits), expected_factor) in afq_types.into_iter().zip(expected) {
+                let group_size = AfqGroupSize::Low as usize;
+                let packed_bytes = (group_size * bits).div_ceil(u8::BITS as usize)
+                    + AFFINE_METADATA_TENSOR_COUNT * dtype.size_in_bytes();
+                assert_eq!(ty.pack_factor(dtype), expected_factor);
+                assert!(group_size / ty.pack_factor(dtype) * dtype.size_in_bytes() >= packed_bytes);
+            }
+        }
+
+        for (dtype, hqq4, hqq8) in [(DType::F16, 3, 1), (DType::BF16, 3, 1), (DType::F32, 6, 3)] {
+            for (ty, bits, expected_factor) in [(IsqType::HQQ4, 4, hqq4), (IsqType::HQQ8, 8, hqq8)]
+            {
+                let packed_bytes = (hqq::ISQ_HQQ_GROUP_SIZE * bits).div_ceil(u8::BITS as usize)
+                    + AFFINE_METADATA_TENSOR_COUNT * DType::F32.size_in_bytes();
+                assert_eq!(ty.pack_factor(dtype), expected_factor);
+                assert!(
+                    hqq::ISQ_HQQ_GROUP_SIZE / ty.pack_factor(dtype) * dtype.size_in_bytes()
+                        >= packed_bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_pack_factors_use_their_storage_contracts() {
+        let afq = QuantizedConfig::Afq {
+            bits: 4,
+            group_size: 64,
+        };
+        assert_eq!(afq.pack_factor(DType::F32), 6);
+
+        let legacy_mxfp4 = QuantizedConfig::GptqAwq {
+            bits: 40,
+            group_size: 32,
+            checkpoint_format: None,
+            is_awq: false,
+        };
+        assert_eq!(legacy_mxfp4.pack_factor(DType::BF16), 3);
+        assert_eq!(legacy_mxfp4.pack_factor(DType::F32), 6);
+
+        let bnb8 = QuantizedConfig::Bitsandbytes {
+            bnb_4bit_quant_type: None,
+        };
+        assert_eq!(bnb8.pack_factor(DType::BF16), 1);
+    }
+
+    #[test]
+    fn immediate_isq_promotion_requires_an_explicit_predicate() {
+        let params = immediate_params(Some(IsqType::AFQ4), Vec::new());
+        let promoted = resolve_immediate_isq(&params, "model.embed_tokens.weight").unwrap();
+        assert_eq!(promoted.ty, Some(IsqType::AFQ6));
+        assert!(promoted.promote_default);
+
+        let lookalike = resolve_immediate_isq(&params, "vision.embed_tokens.weight").unwrap();
+        assert_eq!(lookalike.ty, Some(IsqType::AFQ4));
+        assert!(!lookalike.promote_default);
+    }
+
+    #[test]
+    fn immediate_isq_explicit_type_wins_over_sensitive_default() {
+        let params = immediate_params(
+            Some(IsqType::AFQ4),
+            vec![ImmediateIsqOverride {
+                predicate: Some(Regex::new(r"^model\.embed_tokens\.weight$").unwrap()),
+                layer_range: None,
+                ty: Some(IsqType::AFQ2),
+                device: None,
+            }],
+        );
+
+        let matched = resolve_immediate_isq(&params, "model.embed_tokens.weight").unwrap();
+        assert_eq!(matched.ty, Some(IsqType::AFQ2));
+        assert!(matched.promote_default);
+    }
+
+    #[test]
+    fn immediate_isq_uses_sensitive_default_only_for_sensitive_tensors() {
+        for (base, sensitive) in [
+            (IsqType::AFQ6, IsqType::AFQ8),
+            (IsqType::Q4K, IsqType::Q6K),
+            (IsqType::Q6K, IsqType::Q8_0),
+        ] {
+            let params = immediate_params(Some(base), Vec::new());
+            let embedding = resolve_immediate_isq(&params, "model.embed_tokens.weight").unwrap();
+            assert_eq!(embedding.ty, Some(sensitive));
+            let projection =
+                resolve_immediate_isq(&params, "model.layers.0.mlp.down_proj.weight").unwrap();
+            assert_eq!(projection.ty, Some(base));
+        }
+    }
+
+    #[test]
+    fn immediate_isq_device_only_override_keeps_sensitive_default() {
+        let params = immediate_params(
+            Some(IsqType::AFQ4),
+            vec![ImmediateIsqOverride {
+                predicate: Some(Regex::new(r"^model\.embed_tokens\.weight$").unwrap()),
+                layer_range: None,
+                ty: None,
+                device: Some(Device::Cpu),
+            }],
+        );
+
+        let matched = resolve_immediate_isq(&params, "model.embed_tokens.weight").unwrap();
+        assert_eq!(matched.ty, Some(IsqType::AFQ6));
+    }
+
+    #[test]
+    fn capture_all_records_promotion_without_pinning_a_type() {
+        let mut params = immediate_params(Some(IsqType::AFQ4), Vec::new());
+        params.capture = IsqCaptureMode::CaptureAll;
+
+        let promoted = resolve_immediate_isq(&params, "model.embed_tokens.weight").unwrap();
+        assert_eq!(promoted.ty, None);
+        assert!(promoted.promote_default);
+
+        let regular =
+            resolve_immediate_isq(&params, "model.layers.0.mlp.down_proj.weight").unwrap();
+        assert_eq!(regular.ty, None);
+        assert!(!regular.promote_default);
     }
 
     #[test]
@@ -2000,6 +2754,142 @@ mod tests {
         assert!(msg.contains("foo.weight"));
         assert!(msg.contains("temporary UQFF placeholders"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn weight_source_linear_participates_in_immediate_isq_tracking() -> Result<()> {
+        let ty = Some(IsqType::Q8_0);
+        let (executor, _) = create_isq_executor(IsqExecutorConfig::new(ty));
+        set_immediate_isq_config(
+            ImmediateIsqConfig::new(
+                ty,
+                vec![Regex::new(r"^foo\.weight$").unwrap()],
+                IsqCaptureMode::CaptureMatches,
+            ),
+            executor,
+        );
+
+        let vb = empty_vb(None)
+            .with_weight_source(Arc::new(DenseWeightSource))
+            .pp("foo");
+        let tracker = vb.tracker().clone();
+        let layer = linear_no_bias(2, 3, &None, vb);
+        clear_immediate_isq();
+
+        layer?.forward_raw(&Tensor::zeros((1, 2), DType::F32, &Device::Cpu)?)?;
+        assert_eq!(tracker.get().len(), 1);
+        assert_eq!(tracker.get()[0].key, "foo");
+        assert_eq!(tracker.get()[0].ty, ty);
+        Ok(())
+    }
+
+    #[test]
+    fn weight_source_precedes_checkpoint_quantization_for_plain_linears() -> Result<()> {
+        let config = Some(QuantizedConfig::GptqAwq {
+            bits: 4,
+            group_size: 128,
+            checkpoint_format: None,
+            is_awq: true,
+        });
+        let vb = || {
+            empty_vb(None)
+                .with_weight_source(Arc::new(DenseWeightSource))
+                .pp("foo")
+        };
+        for layer in [
+            linear_no_bias(2, 3, &config, vb())?,
+            linear(2, 3, &config, vb())?,
+        ] {
+            assert_eq!(layer.name(), "unquant-linear");
+            assert_eq!(
+                layer
+                    .forward_raw(&Tensor::zeros((1, 2), DType::F32, &Device::Cpu)?)?
+                    .dims(),
+                &[1, 3]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uqff_source_precedes_checkpoint_quantization_for_plain_linears() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(candle_core::Error::wrap)?;
+        let path = dir.path().join("source-first.uqff");
+        let mut tensors = uqff_version_tensors();
+        for (prefix, bias) in [("no_bias", false), ("with_bias", true)] {
+            let bias = if bias {
+                Some(Tensor::zeros(3, DType::F32, &Device::Cpu)?)
+            } else {
+                None
+            };
+            let layer = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(
+                Tensor::zeros((3, 2), DType::F32, &Device::Cpu)?,
+                bias,
+            )))?;
+            tensors.extend(layer.serialize_uqff(prefix, IsqType::Q4K)?);
+        }
+        ::safetensors::serialize_to_file(
+            tensors.iter().map(|tensor| (tensor.name(), tensor)),
+            None,
+            &path,
+        )
+        .map_err(candle_core::Error::wrap)?;
+
+        let reader = Arc::new(UqffReader::open(&[path])?);
+        let config = Some(QuantizedConfig::GptqAwq {
+            bits: 4,
+            group_size: 128,
+            checkpoint_format: None,
+            is_awq: true,
+        });
+        let vb = |prefix| empty_vb(None).with_uqff_reader(reader.clone()).pp(prefix);
+        for layer in [
+            linear_no_bias(2, 3, &config, vb("no_bias"))?,
+            linear(2, 3, &config, vb("with_bias"))?,
+        ] {
+            assert_eq!(layer.name(), "unquant-linear");
+            assert_eq!(
+                layer
+                    .forward_raw(&Tensor::zeros((1, 2), DType::F32, &Device::Cpu)?)?
+                    .dims(),
+                &[1, 3]
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn weight_source_stages_immediate_isq_on_cpu() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let load_devices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let source = Arc::new(RecordingWeightSource {
+            load_devices: load_devices.clone(),
+        });
+        let vb = ShardedSafeTensors::wrap(HashMap::new(), DType::F32, device)
+            .with_weight_source(source)
+            .pp("foo");
+
+        let ty = Some(IsqType::Q8_0);
+        let (executor, _) = create_isq_executor(IsqExecutorConfig::new(ty));
+        set_immediate_isq_config(
+            ImmediateIsqConfig::new(
+                ty,
+                vec![Regex::new(r"^foo\.weight$").unwrap()],
+                IsqCaptureMode::CaptureMatches,
+            ),
+            executor,
+        );
+        let tracker = vb.tracker().clone();
+        linear_no_bias(2, 3, &None, vb.clone())?;
+        tracker.get()[0].ct.resolve()?;
+        clear_immediate_isq();
+
+        linear_no_bias(2, 3, &None, vb)?;
+        assert_eq!(&*load_devices.lock().unwrap(), &[true, false]);
         Ok(())
     }
 }

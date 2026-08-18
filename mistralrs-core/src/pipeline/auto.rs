@@ -9,7 +9,10 @@ use super::{
 };
 use crate::utils::progress::ProgressScopeGuard;
 use crate::Ordering;
-use crate::{DeviceMapSetting, IsqType, PagedAttentionConfig, Pipeline, TryIntoDType};
+use crate::{
+    AutoDeviceMapParams, DeviceMapSetting, IsqType, LoraAdapterSpec, LoraRuntimeConfig,
+    PagedAttentionConfig, Pipeline, TryIntoDType,
+};
 use anyhow::Result;
 use candle_core::Device;
 use hf_hub::{
@@ -32,6 +35,7 @@ pub struct AutoLoader {
     embedding_builder: Mutex<Option<EmbeddingLoaderBuilder>>,
     loader: Mutex<Option<Box<dyn Loader>>>,
     hf_cache_path: Option<PathBuf>,
+    dynamic_lora_enabled: bool,
 }
 
 pub struct AutoLoaderBuilder {
@@ -46,8 +50,10 @@ pub struct AutoLoaderBuilder {
     xlora_model_id: Option<String>,
     xlora_order: Option<Ordering>,
     tgt_non_granular_index: Option<usize>,
-    lora_adapter_ids: Option<Vec<String>>,
+    lora_adapters: Option<Vec<LoraAdapterSpec>>,
+    lora_runtime_config: Option<LoraRuntimeConfig>,
     hf_cache_path: Option<PathBuf>,
+    mtp: bool,
 }
 
 impl AutoLoaderBuilder {
@@ -74,9 +80,17 @@ impl AutoLoaderBuilder {
             xlora_model_id: None,
             xlora_order: None,
             tgt_non_granular_index: None,
-            lora_adapter_ids: None,
+            lora_adapters: None,
+            lora_runtime_config: None,
             hf_cache_path: None,
+            mtp: false,
         }
+    }
+
+    /// Load the MTP head built into the checkpoint so it can drive speculative decoding.
+    pub fn with_mtp(mut self, mtp: bool) -> Self {
+        self.mtp = mtp;
+        self
     }
 
     pub fn with_xlora(
@@ -93,8 +107,13 @@ impl AutoLoaderBuilder {
         self
     }
 
-    pub fn with_lora(mut self, adapters: Vec<String>) -> Self {
-        self.lora_adapter_ids = Some(adapters);
+    pub fn with_lora(
+        mut self,
+        adapters: Vec<LoraAdapterSpec>,
+        runtime_config: LoraRuntimeConfig,
+    ) -> Self {
+        self.lora_adapters = Some(adapters);
+        self.lora_runtime_config = Some(runtime_config);
         self
     }
 
@@ -116,8 +135,10 @@ impl AutoLoaderBuilder {
             xlora_model_id,
             xlora_order,
             tgt_non_granular_index,
-            lora_adapter_ids,
+            lora_adapters,
+            lora_runtime_config,
             hf_cache_path,
+            mtp,
         } = self;
 
         let mut normal_builder = NormalLoaderBuilder::new(
@@ -132,12 +153,14 @@ impl AutoLoaderBuilder {
             normal_builder =
                 normal_builder.with_xlora(id, ord, no_kv_cache, tgt_non_granular_index);
         }
-        if let Some(ref adapters) = lora_adapter_ids {
-            normal_builder = normal_builder.with_lora(adapters.clone());
+        if let (Some(adapters), Some(runtime_config)) = (lora_adapters.clone(), lora_runtime_config)
+        {
+            normal_builder = normal_builder.with_lora(adapters, runtime_config);
         }
         if let Some(ref path) = hf_cache_path {
             normal_builder = normal_builder.hf_cache_path(path.clone());
         }
+        normal_builder = normal_builder.with_mtp(mtp);
 
         let mut multimodal_builder = MultimodalLoaderBuilder::new(
             multimodal_cfg,
@@ -146,18 +169,17 @@ impl AutoLoaderBuilder {
             Some(model_id.clone()),
             jinja_explicit,
         );
-        if let Some(ref adapters) = lora_adapter_ids {
-            multimodal_builder = multimodal_builder.with_lora(adapters.clone());
+        if let (Some(adapters), Some(runtime_config)) = (lora_adapters.clone(), lora_runtime_config)
+        {
+            multimodal_builder = multimodal_builder.with_lora(adapters, runtime_config);
         }
         if let Some(ref path) = hf_cache_path {
             multimodal_builder = multimodal_builder.hf_cache_path(path.clone());
         }
+        multimodal_builder = multimodal_builder.with_mtp(mtp);
 
         let mut embedding_builder =
             EmbeddingLoaderBuilder::new(embedding_cfg, tokenizer_json, Some(model_id.clone()));
-        if let Some(ref adapters) = lora_adapter_ids {
-            embedding_builder = embedding_builder.with_lora(adapters.clone());
-        }
         if let Some(ref path) = hf_cache_path {
             embedding_builder = embedding_builder.hf_cache_path(path.clone());
         }
@@ -169,6 +191,7 @@ impl AutoLoaderBuilder {
             embedding_builder: Mutex::new(Some(embedding_builder)),
             loader: Mutex::new(None),
             hf_cache_path,
+            dynamic_lora_enabled: lora_adapters.is_some(),
         })
     }
 }
@@ -192,6 +215,14 @@ enum Detected {
     Embedding(Option<EmbeddingLoaderType>),
     Diffusion(DiffusionLoaderType),
     Speech(crate::speech_models::SpeechLoaderType),
+}
+
+fn supports_dynamic_lora(detected: &Detected) -> bool {
+    match detected {
+        Detected::Normal(_) => true,
+        Detected::Multimodal(loader) => super::multimodal::supports_dynamic_lora_loader(loader),
+        _ => false,
+    }
 }
 
 impl AutoLoader {
@@ -394,12 +425,15 @@ impl AutoLoader {
         Ok(Detected::Normal(tp))
     }
 
-    fn ensure_loader(&self, artifacts: &ConfigArtifacts) -> Result<()> {
+    fn ensure_loader(&self, detected: Detected) -> Result<()> {
         let mut guard = self.loader.lock().unwrap();
         if guard.is_some() {
             return Ok(());
         }
-        match self.detect(artifacts)? {
+        if self.dynamic_lora_enabled && !supports_dynamic_lora(&detected) {
+            anyhow::bail!("dynamic LoRA is not supported for this model architecture");
+        }
+        match detected {
             Detected::Normal(tp) => {
                 let builder = self
                     .normal_builder
@@ -407,7 +441,7 @@ impl AutoLoader {
                     .unwrap()
                     .take()
                     .expect("builder taken");
-                let loader = builder.build(Some(tp)).expect("build normal");
+                let loader = builder.build(Some(tp))?;
                 *guard = Some(loader);
             }
             Detected::Multimodal(tp) => {
@@ -448,6 +482,38 @@ impl AutoLoader {
     }
 }
 
+fn device_map_for_detected(mapper: DeviceMapSetting, detected: &Detected) -> DeviceMapSetting {
+    match (mapper, detected) {
+        (
+            DeviceMapSetting::Auto(AutoDeviceMapParams::Text {
+                max_seq_len,
+                max_batch_size,
+            }),
+            Detected::Multimodal(_),
+        ) => DeviceMapSetting::Auto(AutoDeviceMapParams::Multimodal {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape: (
+                AutoDeviceMapParams::DEFAULT_MAX_IMAGE_LENGTH,
+                AutoDeviceMapParams::DEFAULT_MAX_IMAGE_LENGTH,
+            ),
+            max_num_images: AutoDeviceMapParams::DEFAULT_MAX_NUM_IMAGES,
+        }),
+        (
+            DeviceMapSetting::Auto(AutoDeviceMapParams::Multimodal {
+                max_seq_len,
+                max_batch_size,
+                ..
+            }),
+            Detected::Normal(_),
+        ) => DeviceMapSetting::Auto(AutoDeviceMapParams::Text {
+            max_seq_len,
+            max_batch_size,
+        }),
+        (mapper, _) => mapper,
+    }
+}
+
 impl Loader for AutoLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn load_model_from_hf(
@@ -463,7 +529,9 @@ impl Loader for AutoLoader {
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>> {
         let _progress_guard = ProgressScopeGuard::new(silent);
         let config = self.read_config_from_hf(revision.clone(), &token_source, silent)?;
-        self.ensure_loader(&config)?;
+        let detected = self.detect(&config)?;
+        let mapper = device_map_for_detected(mapper, &detected);
+        self.ensure_loader(detected)?;
         self.loader
             .lock()
             .unwrap()
@@ -484,7 +552,7 @@ impl Loader for AutoLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn load_model_from_path(
         &self,
-        paths: &Box<dyn ModelPaths>,
+        paths: &dyn ModelPaths,
         dtype: &dyn TryIntoDType,
         device: &Device,
         silent: bool,
@@ -493,8 +561,10 @@ impl Loader for AutoLoader {
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>> {
         let _progress_guard = ProgressScopeGuard::new(silent);
-        let config = self.read_config_from_path(paths.as_ref())?;
-        self.ensure_loader(&config)?;
+        let config = self.read_config_from_path(paths)?;
+        let detected = self.detect(&config)?;
+        let mapper = device_map_for_detected(mapper, &detected);
+        self.ensure_loader(detected)?;
         self.loader
             .lock()
             .unwrap()
@@ -522,5 +592,101 @@ impl Loader for AutoLoader {
             .as_ref()
             .map(|l| l.get_kind())
             .unwrap_or(ModelKind::Normal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detector() -> AutoLoader {
+        AutoLoader {
+            model_id: "Qwen/Qwen3.6-35B-A3B".to_string(),
+            normal_builder: Mutex::new(None),
+            multimodal_builder: Mutex::new(None),
+            embedding_builder: Mutex::new(None),
+            loader: Mutex::new(None),
+            hf_cache_path: None,
+            dynamic_lora_enabled: true,
+        }
+    }
+
+    #[test]
+    fn qwen3_5_moe_auto_detection_routes_dynamic_lora_to_multimodal() {
+        let detected = detector()
+            .detect(&ConfigArtifacts {
+                contents: Some(
+                    r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"]}"#.to_string(),
+                ),
+                sentence_transformers_present: false,
+                repo_files: Vec::new(),
+                remote_access_issue: None,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            detected,
+            Detected::Multimodal(MultimodalLoaderType::Qwen3_5Moe)
+        ));
+    }
+
+    #[test]
+    fn dynamic_lora_auto_detection_accepts_supported_multimodal_language_models() {
+        assert!(supports_dynamic_lora(&Detected::Normal(
+            NormalLoaderType::Qwen3Moe
+        )));
+        for loader in [
+            MultimodalLoaderType::Qwen2VL,
+            MultimodalLoaderType::Qwen2_5VL,
+            MultimodalLoaderType::Qwen3VL,
+            MultimodalLoaderType::Qwen3VLMoE,
+            MultimodalLoaderType::Qwen3_5,
+            MultimodalLoaderType::Qwen3_5Moe,
+            MultimodalLoaderType::Gemma3,
+            MultimodalLoaderType::Gemma3n,
+            MultimodalLoaderType::Idefics3,
+            MultimodalLoaderType::Mistral3,
+            MultimodalLoaderType::Llama4,
+            MultimodalLoaderType::Lfm2Vl,
+            MultimodalLoaderType::Gemma4,
+            MultimodalLoaderType::MuseGlimmer,
+        ] {
+            assert!(supports_dynamic_lora(&Detected::Multimodal(loader)));
+        }
+        assert!(!supports_dynamic_lora(&Detected::Multimodal(
+            MultimodalLoaderType::Phi3V
+        )));
+        assert!(!supports_dynamic_lora(&Detected::Embedding(None)));
+    }
+
+    #[test]
+    fn multimodal_detection_promotes_text_auto_device_mapping() {
+        let mapper = device_map_for_detected(
+            DeviceMapSetting::Auto(AutoDeviceMapParams::Text {
+                max_seq_len: 8192,
+                max_batch_size: 3,
+            }),
+            &Detected::Multimodal(MultimodalLoaderType::Qwen3_5),
+        );
+
+        let DeviceMapSetting::Auto(AutoDeviceMapParams::Multimodal {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        }) = mapper
+        else {
+            panic!("expected multimodal device mapping")
+        };
+        assert_eq!(max_seq_len, 8192);
+        assert_eq!(max_batch_size, 3);
+        assert_eq!(
+            max_image_shape,
+            (
+                AutoDeviceMapParams::DEFAULT_MAX_IMAGE_LENGTH,
+                AutoDeviceMapParams::DEFAULT_MAX_IMAGE_LENGTH,
+            )
+        );
+        assert_eq!(max_num_images, AutoDeviceMapParams::DEFAULT_MAX_NUM_IMAGES);
     }
 }

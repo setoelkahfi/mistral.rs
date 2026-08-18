@@ -51,17 +51,17 @@ The install script detects your platform and downloads a matching prebuilt binar
 <details>
 <summary>Install locations, per-platform binaries, and environment variables</summary>
 
-Prebuilt binaries do not require Rust or a CUDA toolkit. Installer-managed binaries install to `~/.mistralrs`, with `mistralrs` symlinked into `~/.local/bin` on Unix and launched from `%USERPROFILE%\.local\bin` on Windows. If needed, the installer adds that directory to your shell environment.
+Prebuilt binaries do not require Rust or a CUDA toolkit for standard acceleration. Installer-managed binaries install to `~/.mistralrs`, with `mistralrs` symlinked into `~/.local/bin` on Unix and launched from `%USERPROFILE%\.local\bin` on Windows. If needed, the installer adds that directory to your shell environment. Optional cuTile acceleration requires NVIDIA's separately installed `tileiras` tool. See [cuTile setup](/mistral.rs/developer/moe-backends/) for the official package commands.
 
-Source builds use Cargo as a staging step, then install to the same managed location.
+Source builds install to the same managed location.
 
 What you get per platform:
 
 | Platform | Binary | Acceleration |
 |---|---|---|
 | Apple Silicon (macOS) | prebuilt | Metal |
-| Linux x86_64 + NVIDIA GPU | prebuilt, matched to GPU and driver | CUDA, flash-attn, cuTile on supported CUDA/SM pairs |
-| Linux aarch64 + NVIDIA GPU (Grace: GH200/GB200/GB10) | prebuilt, matched to GPU and driver | CUDA, flash-attn, cuTile on supported CUDA/SM pairs |
+| Linux x86_64 + NVIDIA GPU | prebuilt, matched to GPU and driver | CUDA, flash-attn, cuTile-capable on supported CUDA/SM pairs |
+| Linux aarch64 + NVIDIA GPU (Grace: GH200/GB200/GB10) | prebuilt, matched to GPU and driver | CUDA, flash-attn, cuTile-capable on supported CUDA/SM pairs |
 | Linux x86_64 / aarch64, no GPU | prebuilt | CPU |
 | Windows x86_64 | prebuilt | CPU |
 | anything else (Intel Mac, an unlisted GPU) | source build | detected at build time |
@@ -72,7 +72,8 @@ For NVIDIA GPUs, the installer checks `nvidia-smi`, then chooses the matching CU
 |---|---|
 | CUDA 13.3+ on Hopper / `sm90` | `cuda133` |
 | CUDA 13.2+ on Ampere/Ada / `sm80`, `sm86`, `sm89` | `cuda132` |
-| CUDA 13.1+ on Blackwell / `sm100`, `sm120`, `sm121` | `cuda131` |
+| CUDA 13.2+ on Blackwell / `sm100`, `sm120`, `sm121` | `cuda132` |
+| CUDA 13.1+ on Blackwell / `sm100`, `sm120`, `sm121` | `cuda131` (no cuTile) |
 | CUDA 13.0+ | `cuda130` |
 | CUDA 12.9+ on GB10 / `sm121` | `cuda129` |
 | CUDA 12.8+ | `cuda128` |
@@ -81,7 +82,7 @@ If no artifact matches the GPU or driver, the installer builds from source. See 
 
 Install-time environment variables:
 
-- `MISTRALRS_INSTALL_TAG=v0.9.0` installs a specific release instead of the latest (downloads that release's prebuilt, or builds that git tag from source).
+- `MISTRALRS_INSTALL_TAG=v0.9.1` installs a specific release instead of the latest (downloads that release's prebuilt, or builds that git tag from source).
 - `MISTRALRS_INSTALL_FROM_SOURCE=1` skips the prebuilt download and builds the latest `master` (bleeding edge) from source. The prebuilt path tracks the latest stable release.
 - `MISTRALRS_INSTALL_NO_NCCL=1` (source builds) skips the `nccl` feature.
 - `MISTRALRS_INSTALL_ALLOW_CUDA_MISMATCH=1` lets a source build continue when local `nvcc` is newer than the CUDA version reported by the NVIDIA driver.
@@ -158,6 +159,21 @@ Commands available at the prompt:
 - `/temperature <float>`, `/topk <int>`, `/topp <float>`: adjust sampling
 
 With multimodal models, include image, audio, or video paths or URLs directly in the prompt. For one-shot use, pass `-i "your prompt"` (optionally with `--image`, `--video`, or `--audio`) to send a single request and exit. The full flag set is in the [CLI reference](/mistral.rs/reference/cli/run/).
+
+### Run GGUF models
+
+Load an exact local file for chat, or select a published quantization from a Hugging Face repository:
+
+```bash
+mistralrs run -f /path/to/model.gguf
+mistralrs serve -m unsloth/Qwen3.5-4B-GGUF --quant 4
+```
+
+The `.gguf` filename selects the format. mistral.rs uses embedded tokenizer and chat-template
+metadata when present, and discovers configuration and multimodal projector files when the
+repository identifies them unambiguously. See [Run GGUF models](/mistral.rs/guides/models/run-gguf/)
+for loading and serving workflows, or [GGUF support](/mistral.rs/reference/gguf-support/) for the
+compatibility matrix.
 
 ## Serve an API
 
@@ -292,11 +308,12 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-`with_auto_isq(IsqBits::Four)` is the in-process equivalent of `--quant 4`. See the [Rust SDK guide](/mistral.rs/guides/rust/getting-started/) for streaming, multimodal input, and sampling options.
+`with_auto_isq(IsqBits::Four)` is the in-process equivalent of `--isq 4`. See the [Rust SDK guide](/mistral.rs/guides/rust/getting-started/) for streaming, multimodal input, and sampling options.
 
 ## Next steps
 
-- [Run any model](/mistral.rs/guides/models/run-any-model/): Hugging Face ids, local files, GGUF, and quantization flags.
+- [Run models](/mistral.rs/guides/models/run-any-model/): Hugging Face IDs, local model directories, pipeline detection, and quantization flags.
+- [Run GGUF models](/mistral.rs/guides/models/run-gguf/): local files, Hub artifacts, multimodal input, LoRA, and overrides.
 - [OpenAI-compatible API](/mistral.rs/guides/serve/openai-compatible-apis/): the canonical serving guide.
 - [Quantization](/mistral.rs/guides/quantization/quantize-a-model/): fit larger models on the same hardware.
 - [Agents & tools](/mistral.rs/guides/agents/): tool calling, web search, code execution, shell, OpenAI-compatible Skills, and MCP (Model Context Protocol).

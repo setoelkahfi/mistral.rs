@@ -2,15 +2,17 @@
 
 mod interactive;
 
-pub(crate) use interactive::interactive_mode;
 use interactive::OneshotInput;
+pub(crate) use interactive::{interactive_mode, InteractiveConfig};
 
 use anyhow::Result;
+use mistralrs_core::{resolve_reasoning_controls, ReasoningEffort};
 use tracing::info;
 
 use mistralrs_core::initialize_logging;
 use mistralrs_server_core::mistralrs_for_server_builder::MistralRsForServerBuilder;
 
+use super::normalize_requested_adapter;
 use super::serve::{
     apply_agent_mode, apply_quant_resolution, convert_to_model_selected, extract_device_settings,
     extract_isq_setting, extract_paged_attn_settings, extract_sandbox_settings, load_mcp_config,
@@ -29,12 +31,17 @@ pub async fn run_interactive(
     sandbox: SandboxOptions,
     global: GlobalOptions,
     thinking: Option<bool>,
+    reasoning_effort: Option<ReasoningEffort>,
     input: Option<String>,
     images: Vec<String>,
     videos: Vec<String>,
     audios: Vec<String>,
+    request_adapter: Option<String>,
 ) -> Result<()> {
     initialize_logging();
+    resolve_reasoning_controls(thinking, reasoning_effort)?;
+
+    let request_adapter = normalize_requested_adapter(&model_type, request_adapter.as_deref())?;
 
     agent_options.apply_to(&mut runtime);
     apply_agent_mode(&mut runtime);
@@ -113,6 +120,13 @@ pub async fn run_interactive(
 
     let mistralrs = builder.build().await?;
 
+    if let Some(alias) = request_adapter.as_deref() {
+        let adapters = mistralrs.list_lora_adapters(None).await?;
+        if !adapters.iter().any(|adapter| adapter.alias == alias) {
+            anyhow::bail!("LoRA adapter alias `{alias}` is not loaded");
+        }
+    }
+
     if let Some(text) = input {
         info!("Model loaded, running one-shot mode...");
         #[cfg(feature = "code-execution")]
@@ -126,16 +140,20 @@ pub async fn run_interactive(
 
         interactive::oneshot_mode(
             mistralrs.clone(),
-            runtime.enable_search,
-            do_code_exec,
-            do_shell,
-            runtime.code_exec_permission.into(),
-            thinking,
             OneshotInput {
                 text,
                 images,
                 videos,
                 audios,
+            },
+            InteractiveConfig {
+                do_search: runtime.enable_search,
+                do_code_exec,
+                do_shell,
+                agent_permission: runtime.code_exec_permission.into(),
+                enable_thinking: thinking,
+                reasoning_effort,
+                adapter: request_adapter,
             },
         )
         .await;
@@ -152,11 +170,15 @@ pub async fn run_interactive(
         info!("Model loaded, starting interactive mode...");
         interactive::interactive_mode(
             mistralrs.clone(),
-            runtime.enable_search,
-            do_code_exec,
-            do_shell,
-            runtime.code_exec_permission.into(),
-            thinking,
+            InteractiveConfig {
+                do_search: runtime.enable_search,
+                do_code_exec,
+                do_shell,
+                agent_permission: runtime.code_exec_permission.into(),
+                enable_thinking: thinking,
+                reasoning_effort,
+                adapter: request_adapter,
+            },
         )
         .await;
     }

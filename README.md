@@ -25,11 +25,13 @@
 
 ## Latest
 
+- **Muse Glimmer 30B**: native text, image, and video inference with ATEM tool calling, reasoning controls, LoRA, ISQ/UQFF, and companion-projector GGUF loading. [Model notes](https://ericlbuehler.github.io/mistral.rs/guides/models/model-family-notes/#muse-glimmer)
+- **GGUF loading**: load a local file with `-f`, or select a published artifact with `--quant`. Tokenizer, configuration, and multimodal projector files are discovered when the available metadata identifies them unambiguously. [Guide](https://ericlbuehler.github.io/mistral.rs/guides/models/run-gguf/)
 - **OpenAI-compatible Skills**: upload `/v1/skills` bundles and reference them from Responses requests for reusable procedures, helper scripts, and local data. [Guide](https://ericlbuehler.github.io/mistral.rs/guides/agents/skills/)
 - **OpenAI-compatible file inputs**: upload `/v1/files`, attach Responses `input_file` or Chat `file` parts, and mount request files into shell/code sessions. [Guide](https://ericlbuehler.github.io/mistral.rs/guides/agents/file-inputs/)
 - **DiffusionGemma**: block-diffusion text generation. Fully integrated: paged attention, prefix caching, ISQ, multimodal, and tool calling. [Guide](https://ericlbuehler.github.io/mistral.rs/guides/models/use-block-diffusion/)
 - **Anthropic Messages API**: `mistralrs serve` now exposes Anthropic-compatible `/v1/messages` and `/v1/messages/count_tokens` endpoints alongside the OpenAI-compatible `/v1` API. [Guide](https://ericlbuehler.github.io/mistral.rs/guides/serve/anthropic-messages-api/)
-- **v0.8.2 CUDA performance**: CUDA graphs, FlashInfer paged kernels, and MoE optimizations deliver strong results on GB10, B200, and H100 SXM. [Benchmarks](#benchmarks)
+- **v0.8.2 CUDA performance**: paged-attention and MoE optimizations deliver strong results on GB10, B200, and H100 SXM. [Benchmarks](#benchmarks)
 - **Agentic runtime**: web search, local Python code execution, shell execution, OpenAI-compatible Skills, session management, and custom tool hooks. [Guide](https://ericlbuehler.github.io/mistral.rs/guides/agents/)
 - **Gemma 4**: full multimodal: text, image, video, and audio input. [Supported models](https://ericlbuehler.github.io/mistral.rs/reference/supported-models/) | [Video setup](https://ericlbuehler.github.io/mistral.rs/guides/models/video-setup/)
 
@@ -88,9 +90,9 @@ Mean tokens per second across prompt lengths and decode depths from 128 to 16384
 
 ## Why mistral.rs?
 
-- **Any Hugging Face model, zero config**: Just `mistralrs run -m user/model`. Architecture, quantization format, and chat template are auto-detected.
+- **Automatic model loading**: Architecture, weight format, and chat template are detected for supported Hugging Face models and GGUF files, with flags available for explicit selection.
 - **True multimodality**: Text, vision, video, and audio, speech generation, image generation, and embeddings in one engine.
-- **Smart quantization**: `--quant` automatically selects the best quantization format at that level: using a prebuilt UQFF if one is published, otherwise applying ISQ. [Docs](https://ericlbuehler.github.io/mistral.rs/guides/quantization/quantize-a-model/)
+- **Quantization selection**: `--quant` selects a matching artifact from GGUF repositories. For other Hugging Face repositories, it uses a prebuilt UQFF when available and otherwise applies ISQ. [Docs](https://ericlbuehler.github.io/mistral.rs/guides/quantization/quantize-a-model/)
 - **OpenAI + Anthropic compatible serving**: The same `mistralrs serve` process exposes OpenAI-compatible `/v1` endpoints and Anthropic-compatible Messages endpoints.
 - **Prometheus metrics**: `mistralrs serve` exposes a `/metrics` endpoint in Prometheus format, recording per-request counts and latency labeled by method, route, and status. [Docs](https://ericlbuehler.github.io/mistral.rs/reference/http-api/)
 - **Built-in web UI**: Served at `/ui` by default. Shows reasoning, code execution, plots, and files inline. Edit any message and the new branch runs with its own Python state. Pass `--no-ui` to disable.
@@ -112,7 +114,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/EricLBueh
 irm https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.ps1 | iex
 ```
 
-Downloads a self-contained prebuilt binary for your platform (Metal on Apple Silicon; per-GPU CUDA or CPU on Linux; CPU on Windows), falling back to a source build if none matches. No Rust or CUDA toolkit needed for the prebuilt path.
+Downloads a self-contained prebuilt binary for your platform (Metal on Apple Silicon; per-GPU CUDA or CPU on Linux; CPU on Windows), falling back to a source build if none matches. Standard acceleration needs no Rust or CUDA toolkit. Optional cuTile acceleration requires NVIDIA's separately installed `tileiras` tool.
 
 [Manual installation, accelerator details & other platforms](https://ericlbuehler.github.io/mistral.rs/quickstart/)
 
@@ -128,6 +130,10 @@ mistralrs run -m Qwen/Qwen3-4B -i "What is the capital of France?"
 # One-shot with an image
 mistralrs run -m google/gemma-4-E4B-it --image photo.jpg -i "Describe this image"
 
+# Run a local GGUF or select a published 4-bit GGUF
+mistralrs run -f /path/to/model.gguf
+mistralrs run -m unsloth/Qwen3.5-4B-GGUF --quant 4
+
 # Agentic REPL: search + code execution + shell from the terminal
 mistralrs run --agent -m Qwen/Qwen3-4B
 
@@ -139,12 +145,12 @@ For the server command, visit `http://localhost:1234/ui` for the web chat interf
 
 ### The `mistralrs` CLI
 
-The CLI is designed to be **zero-config**: just point it at a model and go.
+The CLI uses the same `run`, `serve`, and `bench` commands for model repositories, local directories, and GGUF files.
 
 - **Auto-detection**: Automatically detects model architecture, quantization format, and chat template
 - **All-in-one**: Single binary for chat, server, benchmarks, and web UI (`run`, `serve`, `bench`)
 - **Hardware-aware tuning**: `mistralrs tune` recommends quantization and device mapping for your model and hardware
-- **Format-agnostic**: Works with Hugging Face models, GGUF files, and [UQFF quantizations](https://ericlbuehler.github.io/mistral.rs/reference/uqff-format/) seamlessly
+- **Model formats**: Hugging Face checkpoints, [GGUF files](https://ericlbuehler.github.io/mistral.rs/guides/models/run-gguf/), and [UQFF quantizations](https://ericlbuehler.github.io/mistral.rs/reference/uqff-format/)
 
 ```bash
 # Recommend settings for your hardware and emit a config file
@@ -153,7 +159,7 @@ mistralrs tune -m Qwen/Qwen3-4B --emit-config config.toml
 # Run using the generated config
 mistralrs from-config -f config.toml
 
-# Diagnose system issues (CUDA, Metal, HuggingFace connectivity)
+# Diagnose system issues (CUDA, Metal, Hugging Face connectivity)
 mistralrs doctor
 ```
 
@@ -173,13 +179,13 @@ mistralrs doctor
 - [PagedAttention](https://ericlbuehler.github.io/mistral.rs/guides/perf/paged-attention/) for high throughput continuous batching on CUDA or Apple Silicon, prefix caching (including multimodal)
 
 **Quantization** ([full docs](https://ericlbuehler.github.io/mistral.rs/reference/quantization-types/))
-- [In-situ quantization (ISQ)](https://ericlbuehler.github.io/mistral.rs/guides/quantization/quantize-a-model/) of any Hugging Face model
-- GGUF (2-8 bit), GPTQ, AWQ, HQQ, FP8, BNB support
+- [In-situ quantization (ISQ)](https://ericlbuehler.github.io/mistral.rs/guides/quantization/quantize-a-model/) for Hugging Face models
+- [GGUF](https://ericlbuehler.github.io/mistral.rs/reference/gguf-support/) (2-8 bit), GPTQ, AWQ, HQQ, FP8, BNB support
 - ⭐ [Per-layer topology](https://ericlbuehler.github.io/mistral.rs/guides/perf/topology/): Fine-tune quantization per layer for optimal quality/speed
 - ⭐ Auto-select fastest quant method for your hardware
 
 **Flexibility**
-- [LoRA & X-LoRA](https://ericlbuehler.github.io/mistral.rs/guides/customize/lora-adapters/) with weight merging
+- [LoRA & X-LoRA](https://ericlbuehler.github.io/mistral.rs/guides/customize/lora-adapters/) with per-request LoRA selection and X-LoRA adapter mixing
 - AnyMoE: Create mixture-of-experts on any base model
 - [Multiple models](https://ericlbuehler.github.io/mistral.rs/guides/serve/multiple-models/): Load/unload at runtime
 

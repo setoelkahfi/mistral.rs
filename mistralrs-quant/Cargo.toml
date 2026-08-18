@@ -22,9 +22,11 @@ lazy_static.workspace = true
 paste.workspace = true
 tracing.workspace = true
 indicatif.workspace = true
+indexmap.workspace = true
 rayon.workspace = true
 libc.workspace = true
 byteorder.workspace = true
+bytemuck.workspace = true
 float8.workspace = true
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
@@ -35,6 +37,7 @@ yoke.workspace = true
 memmap2.workspace = true
 safetensors.workspace = true
 regex.workspace = true
+fancy-regex.workspace = true
 hf-hub.workspace = true
 tokio.workspace = true
 futures.workspace = true

@@ -13,8 +13,9 @@ The `mistralrs` Python package exposes the same engine that powers the `mistralr
 
 ```bash
 pip install mistralrs                                   # CPU / Metal (PyPI)
-pip install "mistralrs==0.9.0+cuda128.sm89" \          # NVIDIA (replace version, CUDA level, and SM)
-  --find-links https://github.com/EricLBuehler/mistral.rs/releases/expanded_assets/v0.9.0
+# NVIDIA (replace version, CUDA level, and SM)
+pip install "mistralrs==0.9.1+cuda128.sm89" \
+  --find-links https://github.com/EricLBuehler/mistral.rs/releases/expanded_assets/v0.9.1
 ```
 
 ## Pages

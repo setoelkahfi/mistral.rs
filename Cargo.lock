@@ -3687,7 +3687,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-pyo3"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "accelerate-src",
  "anyhow",
@@ -3723,6 +3723,7 @@ dependencies = [
  "data-url",
  "either",
  "futures",
+ "http-body",
  "image",
  "indexmap 2.13.0",
  "intel-mkl-src",
@@ -4315,6 +4316,7 @@ dependencies = [
  "libc",
  "llguidance",
  "lrtable",
+ "metrics",
  "mime_guess",
  "minijinja",
  "minijinja-contrib",
@@ -4356,6 +4358,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "serde_plain",
+ "sha2",
  "statrs",
  "strum 0.27.2",
  "symphonia",
@@ -4450,6 +4453,7 @@ dependencies = [
 name = "onde-mistralrs-quant"
 version = "0.9.3"
 dependencies = [
+ "bytemuck",
  "byteorder",
  "candle-metal-kernels",
  "cuda-async",
@@ -4460,10 +4464,12 @@ dependencies = [
  "cutile-compiler",
  "cutile-ir",
  "dispatch2",
+ "fancy-regex 0.14.0",
  "float8",
  "futures",
  "half",
  "hf-hub",
+ "indexmap 2.13.0",
  "indicatif 0.18.3",
  "lazy_static",
  "libc",

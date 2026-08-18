@@ -22,7 +22,9 @@ pub const _PAD_SLOT_ID: i64 = -1;
 pub use attention_backend::AttentionBackendKind;
 pub use cache_engine::{CacheConfig, CacheEngine, PagedCacheType};
 use candle_core::{DType, Device};
-pub use config::{KvCacheLayout, KvCacheTopology, ModelConfigLike, ModelConfigMetadata};
+pub use config::{
+    HybridPagedKvCacheConfig, KvCacheLayout, KvCacheTopology, ModelConfigLike, ModelConfigMetadata,
+};
 pub use kv_cache_manager::KVCacheManager;
 pub use layers::PagedAttention;
 pub use scheduler::{
@@ -33,6 +35,43 @@ use crate::MemoryUsage;
 use tracing::info;
 
 pub const DEFAULT_PAGED_ATTENTION_BLOCK_SIZE: usize = 32;
+
+pub(crate) fn block_aligned_sliding_window_start(
+    full_len: usize,
+    query_len: usize,
+    window: usize,
+    block_size: usize,
+) -> usize {
+    let retained_len = window
+        .saturating_sub(1)
+        .saturating_add(query_len)
+        .min(full_len);
+    ((full_len - retained_len) / block_size) * block_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_aligned_sliding_window_start;
+
+    #[test]
+    fn sliding_window_retains_prior_window_and_whole_query() {
+        assert_eq!(block_aligned_sliding_window_start(100, 1, 4, 32), 96);
+        assert_eq!(block_aligned_sliding_window_start(100, 10, 4, 32), 64);
+        assert_eq!(block_aligned_sliding_window_start(8, 8, 4, 32), 0);
+
+        for full_len in 1..130 {
+            for query_len in 1..=full_len {
+                for window in [1, 2, 4, 31, 32, 33, 128] {
+                    let start = block_aligned_sliding_window_start(full_len, query_len, window, 32);
+                    let required_start =
+                        full_len.saturating_sub(window.saturating_sub(1).saturating_add(query_len));
+                    assert!(start <= required_start);
+                    assert!(required_start - start < 32);
+                }
+            }
+        }
+    }
+}
 
 /// All memory counts in MB. Default for block size is 32.
 #[derive(Clone, Copy, Debug)]
@@ -81,17 +120,13 @@ const SIZE_IN_MB: usize = 1024 * 1024;
 
 macro_rules! mb_to_blocks {
     ($mb_size:expr, $dtype_size:expr, $block_size:expr, $config:expr) => {
-        $mb_size
-            / $dtype_size
-            / $block_size
-            / $config.num_layers()
-            / $config.kv_cache_elements_per_token()
+        $mb_size / $dtype_size / $block_size / $config.total_kv_cache_elements_per_token()
     };
 }
 
 macro_rules! ctxt_to_blocks {
     ($context_len:expr, $dtype_size:expr, $block_size:expr, $config:expr) => {
-        $context_len * $dtype_size * $config.num_layers() * $config.kv_cache_elements_per_token()
+        $context_len * $dtype_size * $config.total_kv_cache_elements_per_token()
     };
 }
 
@@ -125,6 +160,7 @@ pub fn calculate_cache_config(
     if !SUPPORTED_BLOCK_SIZE.contains(&block_size) {
         anyhow::bail!("Block size must be in {SUPPORTED_BLOCK_SIZE:?}, got {block_size}");
     }
+    let model_dtype = dtype;
     let dtype = cache_type.to_dtype(dtype);
     let dtype_size = dtype.size_in_bytes();
 
@@ -134,11 +170,17 @@ pub fn calculate_cache_config(
         model_weight_size_in_bytes.unwrap_or(0) / num_devices / SIZE_IN_MB;
 
     let mut min_mem_gpu = usize::MAX;
+    let mut affine_reserved_mb = 0usize;
     for dev in layer_devices {
         let device = dev.as_ref().unwrap_or(device);
+        let post_load_memory = if model_weight_size_in_bytes.is_none() && device.is_cuda() {
+            Some(MemoryUsage.query(device)?)
+        } else {
+            None
+        };
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-        let mem_gpu = match mem_gpu {
+        let mut mem_gpu_mb = match mem_gpu {
             MemoryGpuConfig::MbAmount(v) => v,
             MemoryGpuConfig::BestEffortMbAmount { target_mb, min_mb } => {
                 if let Some(min_mb) = min_mb {
@@ -151,13 +193,16 @@ pub fn calculate_cache_config(
                 target_mb
             }
             MemoryGpuConfig::Utilization(f) => {
-                let mem = MemoryUsage.query(device)?;
-                let total = mem.total() as f32 / SIZE_IN_MB as f32;
+                let memory = match post_load_memory {
+                    Some(memory) => memory,
+                    None => MemoryUsage.query(device)?,
+                };
+                let total = memory.total() as f32 / SIZE_IN_MB as f32;
                 if model_weight_size_in_bytes.is_some() {
                     // Pre-loading: compute budget from total memory and known model size.
                     (total * f - model_weight_per_device_mb as f32).max(0.0) as usize
                 } else {
-                    let used = (mem.total() - mem.available()) as f32 / SIZE_IN_MB as f32;
+                    let used = (memory.total() - memory.available()) as f32 / SIZE_IN_MB as f32;
                     (total * f - used).max(0.0) as usize
                 }
             }
@@ -166,7 +211,18 @@ pub fn calculate_cache_config(
                 ctxt_to_blocks!(toks, dtype_size, block_size, config) / SIZE_IN_MB
             }
         };
-        min_mem_gpu = min_mem_gpu.min(mem_gpu);
+        // Weights are loaded by now, so the repacked copy has an exact size. Charge it to the
+        // budget like any other resident allocation rather than correcting the cache afterwards.
+        if post_load_memory.is_some() {
+            let affine_mb =
+                mistralrs_quant::gguf_affine_budget_bytes(device, model_dtype) / SIZE_IN_MB;
+            affine_reserved_mb = affine_reserved_mb.max(affine_mb);
+            mem_gpu_mb = mem_gpu_mb.saturating_sub(affine_mb);
+        }
+        min_mem_gpu = min_mem_gpu.min(mem_gpu_mb);
+    }
+    if affine_reserved_mb > 0 && !silent {
+        info!("Reserving {affine_reserved_mb} MB per GPU for packed GGUF affine weights.");
     }
 
     // On Metal (unified memory), cap KV cache to what the model can actually use.

@@ -412,14 +412,20 @@ pub fn causal_conv1d_cuda(
 
             Ok((output, conv_state_new))
         } else {
-            // Full path: allocate new conv_state and output
             let output_buf = unsafe { dev.alloc::<T>(batch_size * conv_dim * seq_len) }?;
             let cs_buf = unsafe { dev.alloc::<T>(batch_size * conv_dim * kernel_size) }?;
+            let (cs_s, cs_l) = conv_state.storage_and_layout();
+            let cs_s = match &*cs_s {
+                candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+                _ => candle::bail!("conv_state must be a cuda tensor"),
+            };
+            let cs_offset = cs_l.start_offset();
 
             unsafe {
                 crate::cuda::ffi::causal_conv1d_full(
                     x_s.slice(x_offset..).device_ptr(x_s.stream()).0 as *const c_void,
                     w_s.slice(w_offset..).device_ptr(w_s.stream()).0 as *const c_void,
+                    cs_s.slice(cs_offset..).device_ptr(cs_s.stream()).0 as *const c_void,
                     cs_buf.device_ptr(cs_buf.stream()).0 as *mut c_void,
                     output_buf.device_ptr(output_buf.stream()).0 as *mut c_void,
                     batch_size as i32,
@@ -447,9 +453,12 @@ pub fn causal_conv1d_cuda(
         }
     }
 
+    let x = x.contiguous()?;
+    let weight = weight.contiguous()?;
+    let conv_state = conv_state.contiguous()?;
     match x.dtype() {
-        DType::F16 => cuda_fwd::<half::f16>(x, weight, conv_state, kernel_size, is_update, 0),
-        DType::BF16 => cuda_fwd::<half::bf16>(x, weight, conv_state, kernel_size, is_update, 1),
+        DType::F16 => cuda_fwd::<half::f16>(&x, &weight, &conv_state, kernel_size, is_update, 0),
+        DType::BF16 => cuda_fwd::<half::bf16>(&x, &weight, &conv_state, kernel_size, is_update, 1),
         other => candle_core::bail!("causal_conv1d_cuda only supports f16/bf16, got {:?}", other),
     }
 }
@@ -480,6 +489,7 @@ pub fn prepare_recurrence_inputs_cuda(
     num_v_heads: usize,
     head_k_dim: usize,
     head_v_dim: usize,
+    tiled_v_heads: bool,
 ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
@@ -499,6 +509,7 @@ pub fn prepare_recurrence_inputs_cuda(
         num_v_heads: usize,
         head_k_dim: usize,
         head_v_dim: usize,
+        tiled_v_heads: bool,
         dtype_code: i32,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let dev = mixed_qkv.device().as_cuda_device()?;
@@ -565,6 +576,7 @@ pub fn prepare_recurrence_inputs_cuda(
                 num_v_heads as i32,
                 head_k_dim as i32,
                 head_v_dim as i32,
+                i32::from(tiled_v_heads),
                 dtype_code,
                 stream,
             );
@@ -607,6 +619,7 @@ pub fn prepare_recurrence_inputs_cuda(
             num_v_heads,
             head_k_dim,
             head_v_dim,
+            tiled_v_heads,
             0,
         ),
         DType::BF16 => cuda_fwd::<half::bf16>(
@@ -621,6 +634,7 @@ pub fn prepare_recurrence_inputs_cuda(
             num_v_heads,
             head_k_dim,
             head_v_dim,
+            tiled_v_heads,
             1,
         ),
         other => candle_core::bail!(
@@ -644,6 +658,7 @@ pub fn prepare_recurrence_inputs_cuda(
     _num_v_heads: usize,
     _head_k_dim: usize,
     _head_v_dim: usize,
+    _tiled_v_heads: bool,
 ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
     candle_core::bail!("prepare_recurrence_inputs_cuda requires the cuda feature")
 }
@@ -662,6 +677,7 @@ pub fn fused_decode_recurrence_cuda(
     num_v_heads: usize,
     head_k_dim: usize,
     head_v_dim: usize,
+    tiled_v_heads: bool,
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
@@ -681,6 +697,7 @@ pub fn fused_decode_recurrence_cuda(
         num_v_heads: usize,
         head_k_dim: usize,
         head_v_dim: usize,
+        tiled_v_heads: bool,
         dtype_code: i32,
     ) -> Result<Tensor> {
         let dev = mixed_qkv.device().as_cuda_device()?;
@@ -745,6 +762,7 @@ pub fn fused_decode_recurrence_cuda(
                 num_v_heads as i32,
                 head_k_dim as i32,
                 head_v_dim as i32,
+                i32::from(tiled_v_heads),
                 dtype_code,
                 stream,
             );
@@ -772,6 +790,7 @@ pub fn fused_decode_recurrence_cuda(
             num_v_heads,
             head_k_dim,
             head_v_dim,
+            tiled_v_heads,
             0,
         ),
         DType::BF16 => cuda_fwd::<half::bf16>(
@@ -786,6 +805,7 @@ pub fn fused_decode_recurrence_cuda(
             num_v_heads,
             head_k_dim,
             head_v_dim,
+            tiled_v_heads,
             1,
         ),
         other => candle_core::bail!(
@@ -809,6 +829,7 @@ pub fn fused_decode_recurrence_cuda(
     _num_v_heads: usize,
     _head_k_dim: usize,
     _head_v_dim: usize,
+    _tiled_v_heads: bool,
 ) -> Result<Tensor> {
     candle_core::bail!("fused_decode_recurrence_cuda requires the cuda feature")
 }
@@ -1186,6 +1207,67 @@ mod tests {
         ] {
             run_case(case, &dev)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn causal_conv1d_full_continuation_matches_one_shot_cuda() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let batch_size = 2;
+        let conv_dim = 19;
+        let seq_len = 7;
+        let split = 3;
+        let kernel_size = 4;
+        let x = tensor3(
+            patterned(batch_size * conv_dim * seq_len, 20, 0.08, 0.01),
+            (batch_size, conv_dim, seq_len),
+            &dev,
+        )?
+        .to_dtype(DType::F16)?;
+        let weight = tensor2(
+            patterned(conv_dim * kernel_size, 21, 0.05, -0.01),
+            (conv_dim, kernel_size),
+            &dev,
+        )?
+        .to_dtype(DType::F16)?;
+        let initial_state = tensor3(
+            patterned(batch_size * conv_dim * kernel_size, 22, 0.03, 0.0),
+            (batch_size, conv_dim, kernel_size),
+            &dev,
+        )?
+        .to_dtype(DType::F16)?;
+
+        let (one_shot, one_shot_state) =
+            causal_conv1d_cuda(&x, &weight, &initial_state, kernel_size, false)?;
+        let (first, first_state) = causal_conv1d_cuda(
+            &x.narrow(2, 0, split)?,
+            &weight,
+            &initial_state,
+            kernel_size,
+            false,
+        )?;
+        let (second, chunked_state) = causal_conv1d_cuda(
+            &x.narrow(2, split, seq_len - split)?,
+            &weight,
+            &first_state,
+            kernel_size,
+            false,
+        )?;
+        let chunked = Tensor::cat(&[first, second], 2)?;
+
+        assert_close(
+            "causal conv output",
+            &flat(&one_shot.to_dtype(DType::F32)?)?,
+            &flat(&chunked.to_dtype(DType::F32)?)?,
+            2.0e-3,
+        );
+        assert_close(
+            "causal conv state",
+            &flat(&one_shot_state.to_dtype(DType::F32)?)?,
+            &flat(&chunked_state.to_dtype(DType::F32)?)?,
+            2.0e-3,
+        );
         Ok(())
     }
 }

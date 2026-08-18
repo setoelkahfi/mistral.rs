@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 
 use crate::args::{
     AdapterOptions, CacheOptions, DeviceOptions, FormatOptions, GlobalOptions, ModelSourceOptions,
-    ModelType, MultimodalOptions, PagedAttentionOptions, QuantizationOptions, RuntimeOptions,
-    SandboxOptions, ServerOptions,
+    ModelType, MultimodalAdapterOptions, MultimodalOptions, PagedAttentionOptions,
+    QuantizationOptions, RuntimeOptions, SandboxOptions, ServerOptions,
 };
-use mistralrs_core::{ModelDType, NormalLoaderType, TokenSource};
+use mistralrs_core::{ModelDType, NormalLoaderType, ReasoningEffort, TokenSource};
 
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -53,6 +53,10 @@ pub struct RunConfig {
     pub models: Vec<ModelEntry>,
     #[serde(default, alias = "enable_thinking")]
     pub thinking: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub adapter: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -155,6 +159,13 @@ fn validate_config(config: &CliConfig) -> Result<()> {
         anyhow::bail!("Config must define at least one model in [[models]]");
     }
 
+    if let CliConfig::Run(cfg) = config {
+        let _ = crate::commands::normalize_requested_adapter(
+            &models[0].to_model_type(false),
+            cfg.adapter.as_deref(),
+        )?;
+    }
+
     if let Some(default_id) = default_model_id {
         let has_model = models.iter().any(|model| model.model_id == *default_id);
         if !has_model {
@@ -167,6 +178,17 @@ fn validate_config(config: &CliConfig) -> Result<()> {
 
     let mut cpu_setting: Option<bool> = None;
     for model in models {
+        model
+            .adapter
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid adapter configuration: {error}"))?;
+        if matches!(model.kind, ModelKind::Multimodal)
+            && (model.adapter.legacy_lora.is_some() || model.adapter.xlora.is_some())
+        {
+            anyhow::bail!(
+                "multimodal models support dynamic language-model LoRA, but not legacy LoRA or X-LoRA"
+            );
+        }
         if let Some(cpu) = model.device.cpu {
             match cpu_setting {
                 None => cpu_setting = Some(cpu),
@@ -248,7 +270,7 @@ impl ModelEntry {
             ModelKind::Multimodal => ModelType::Multimodal {
                 model,
                 format: self.format.clone(),
-                adapter: self.adapter.clone(),
+                adapter: MultimodalAdapterOptions::from_adapter_options(&self.adapter),
                 quantization: self.quantization.clone(),
                 device,
                 cache,
@@ -318,5 +340,106 @@ model_id = "google/gemma-4-E4B-it"
             cfg.models[0].to_model_type(false),
             ModelType::Multimodal { .. }
         ));
+    }
+
+    #[test]
+    fn run_config_uses_structured_lora_preloads_and_explicit_selection() {
+        let config: CliConfig = toml::from_str(
+            r#"
+command = "run"
+adapter = "code"
+
+[[models]]
+model_id = "org/base"
+
+[models.adapter]
+enable_lora = true
+lora = [{ alias = "code", source = "org/code-lora", revision = "refs/pr/7" }]
+lora_max_adapters = 4
+lora_max_rank = 64
+lora_max_bytes = 1048576
+"#,
+        )
+        .unwrap();
+
+        validate_config(&config).unwrap();
+        let cfg = match config {
+            CliConfig::Run(cfg) => cfg,
+            CliConfig::Serve(_) => panic!("expected run config"),
+        };
+        assert_eq!(cfg.adapter.as_deref(), Some("code"));
+        assert_eq!(cfg.models[0].adapter.lora[0].alias, "code");
+        assert_eq!(cfg.models[0].adapter.lora[0].source, "org/code-lora");
+        assert_eq!(cfg.models[0].adapter.lora[0].revision(), "refs/pr/7");
+        assert_eq!(cfg.models[0].adapter.lora_runtime_config().max_rank, 64);
+    }
+
+    #[test]
+    fn duplicate_toml_lora_aliases_are_rejected() {
+        let config: CliConfig = toml::from_str(
+            r#"
+command = "serve"
+
+[[models]]
+model_id = "org/base"
+
+[models.adapter]
+lora = [
+    { alias = "code", source = "org/first" },
+    { alias = "code", source = "org/second" },
+]
+"#,
+        )
+        .unwrap();
+
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("more than once"));
+    }
+
+    #[test]
+    fn multimodal_toml_rejects_legacy_adapter_modes() {
+        let config: CliConfig = toml::from_str(
+            r#"
+command = "serve"
+
+[[models]]
+kind = "multimodal"
+model_id = "org/vision"
+
+[models.adapter]
+legacy_lora = "org/legacy"
+legacy_lora_order = "order.json"
+"#,
+        )
+        .unwrap();
+
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("not legacy LoRA or X-LoRA"));
+    }
+
+    #[test]
+    fn run_config_rejects_unconfigured_adapter_selection() {
+        let config: CliConfig = toml::from_str(
+            r#"
+command = "run"
+adapter = "math"
+
+[[models]]
+model_id = "org/base"
+
+[models.adapter]
+lora = [{ alias = "code", source = "org/code-lora" }]
+"#,
+        )
+        .unwrap();
+
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("not configured"));
     }
 }

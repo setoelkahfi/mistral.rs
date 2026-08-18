@@ -63,6 +63,7 @@ export default defineConfig({
     // SDKs + customize ( /guides/python/ , /guides/rust/ , /guides/customize/ keep real index pages)
     '/guides/customize/anymoe/': '/mistral.rs/guides/customize/lora-adapters/',
     '/guides/customize/matformer/': '/mistral.rs/guides/models/model-family-notes/#matformer',
+    '/examples/python/lora-zephyr/': '/mistral.rs/examples/python/lora/',
     '/explanation/mla/': '/mistral.rs/guides/models/model-family-notes/',
     // Reference + developer
     '/reference/server-config/': '/mistral.rs/reference/cli-toml-config/',
@@ -119,6 +120,7 @@ export default defineConfig({
               collapsed: true,
               items: [
                 'guides/models/run-any-model',
+                'guides/models/run-gguf',
                 'guides/models/model-family-notes',
                 'guides/models/multimodal-input',
                 'guides/models/video-setup',
@@ -210,18 +212,18 @@ export default defineConfig({
         {
           label: 'Examples',
           collapsed: true,
-          autogenerate: { directory: 'examples' },
+          items: [{ autogenerate: { directory: 'examples', collapsed: true } }],
         },
         {
           label: 'Reference',
           collapsed: true,
-          autogenerate: { directory: 'reference' },
+          items: [{ autogenerate: { directory: 'reference', collapsed: true } }],
         },
         ...openAPISidebarGroups,
         {
           label: 'Developer Guide',
           collapsed: true,
-          autogenerate: { directory: 'developer' },
+          items: [{ autogenerate: { directory: 'developer', collapsed: true } }],
         },
       ],
       customCss: ['./src/styles/custom.css'],
