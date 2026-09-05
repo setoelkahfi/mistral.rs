@@ -4333,7 +4333,6 @@ dependencies = [
  "onde-mistralrs-quant",
  "onde-mistralrs-sandbox",
  "onde-mistralrs-vision",
- "onde-tqdm",
  "openai-harmony",
  "ordered-float",
  "parking_lot",
@@ -4372,6 +4371,7 @@ dependencies = [
  "toktrie",
  "toktrie_hf_tokenizers",
  "toml 0.9.11+spec-1.1.0",
+ "tqdm",
  "tracing",
  "tracing-subscriber",
  "urlencoding",
@@ -4516,17 +4516,6 @@ dependencies = [
  "image",
  "onde-candle-core",
  "rayon",
-]
-
-[[package]]
-name = "onde-tqdm"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d96f4fcb4af06959bf9c9b81ace0502e2be2d11d7e037c94f3f7851bde720ea"
-dependencies = [
- "anyhow",
- "crossterm 0.29.0",
- "once_cell",
 ]
 
 [[package]]
@@ -7218,6 +7207,17 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tqdm"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a882329b482cea1d2762e9b9ff1ed0f0327a1ec3a9ba7b8e8c4e3635908a4ae5"
+dependencies = [
+ "anyhow",
+ "crossterm 0.29.0",
+ "once_cell",
+]
 
 [[package]]
 name = "tracing"
