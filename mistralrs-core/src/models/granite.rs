@@ -2126,7 +2126,9 @@ impl GraniteMoeHybrid {
             recurrent: RecurrentLayerConfig {
                 conv_dim: cfg.mamba_conv_dim(),
                 conv_width: cfg.mamba_d_conv,
-                state_dims: vec![cfg.mamba_n_heads(), cfg.mamba_d_head(), cfg.mamba_d_state],
+                state: crate::kv_cache::RecurrentStateSpec::Opaque {
+                    dims: vec![cfg.mamba_n_heads(), cfg.mamba_d_head(), cfg.mamba_d_state],
+                },
                 recurrent_dtype: None,
             },
         };
@@ -2331,7 +2333,7 @@ impl GraniteMoeHybrid {
         let x = self.ln_f.forward(&x)?;
         let x = ctx.logits(&x)?;
 
-        let mut logits = self.lm_head.forward(&x)?;
+        let mut logits = ctx.lm_head(&*self.lm_head, &x)?;
 
         // Scale logits
         logits = scale_tensor(logits, self.logits_scaling)?;

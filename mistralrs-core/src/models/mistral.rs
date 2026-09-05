@@ -468,6 +468,7 @@ impl Model {
                             })?,
                             mscale: rope.mscale.unwrap_or(1.),
                             mscale_all_dim: rope.mscale_all_dim.unwrap_or(0.),
+                            attention_factor: None,
                         },
                         device,
                         is_gptx,
@@ -612,7 +613,7 @@ impl Model {
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
         let xs = ctx.logits(&xs)?;
-        self.lm_head.forward(&xs)
+        ctx.lm_head(&*self.lm_head, &xs)
     }
 }
 
