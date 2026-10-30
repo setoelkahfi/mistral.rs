@@ -9,7 +9,7 @@ const GIB: usize = 1024 * 1024 * 1024;
 const DISCRETE_RESERVE_FRACTION: f64 = 0.05;
 const UNIFIED_RESERVE_FRACTION: f64 = 0.25;
 const MIN_DISCRETE_RESERVE: usize = GIB;
-const MAX_UNIFIED_RESERVE: usize = 16 * GIB;
+const MAX_UNIFIED_RESERVE: usize = GIB.saturating_mul(16);
 pub const DEFAULT_MAX_NUM_SEQS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -49,19 +49,20 @@ impl FromStr for MemoryGoal {
         let split = value
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(value.len());
-        let amount: usize = value[..split]
+        let amount: u64 = value[..split]
             .parse()
             .context("KV capacity must start with a positive integer")?;
         let unit = value[split..].trim().to_ascii_lowercase();
         let goal = if matches!(unit.as_str(), "token" | "tokens") {
-            Self::KvTokens(amount)
+            Self::KvTokens(usize::try_from(amount).context("KV capacity overflows usize")?)
         } else {
-            let multiplier: usize = match unit.as_str() {
+            // Computed in u64 so 32-bit targets don't overflow the unit constants.
+            let multiplier: u64 = match unit.as_str() {
                 "b" => 1,
                 "kib" => 1024,
                 "mib" => 1024 * 1024,
-                "gib" => GIB,
-                "tib" => 1024 * GIB,
+                "gib" => 1024 * 1024 * 1024,
+                "tib" => 1024 * 1024 * 1024 * 1024,
                 "kb" => 1000,
                 "mb" => 1000 * 1000,
                 "gb" => 1000 * 1000 * 1000,
@@ -70,11 +71,10 @@ impl FromStr for MemoryGoal {
                     "KV capacity requires a byte unit or 'tokens', for example 4GiB or 65536tokens"
                 ),
             };
-            Self::KvBytes(
-                amount
-                    .checked_mul(multiplier)
-                    .context("KV capacity overflows usize")?,
-            )
+            let bytes = amount
+                .checked_mul(multiplier)
+                .context("KV capacity overflows usize")?;
+            Self::KvBytes(usize::try_from(bytes).context("KV capacity overflows usize")?)
         };
         goal.validate()?;
         Ok(goal)

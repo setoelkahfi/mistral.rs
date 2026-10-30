@@ -194,7 +194,7 @@ nix = { version = "0.31.3", default-features = false }
 itoa = "1.0.18"
 cutile = "=0.3.1"
 
-mistralrs-core = { path = "mistralrs-core", version = "0.9.5", package = "onde-mistralrs-core" }
+mistralrs-core = { path = "mistralrs-core", version = "0.9.6", package = "onde-mistralrs-core" }
 mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.9.5", package = "onde-mistralrs-paged-attn" }
 mistralrs-metal-compile = { path = "mistralrs-metal-compile", version = "0.9.5", package = "onde-mistralrs-metal-compile" }
 mistralrs-flash-attn = { path = "mistralrs-flash-attn", version = "0.9.5", package = "onde-mistralrs-flash-attn" }
