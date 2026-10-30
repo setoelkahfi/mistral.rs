@@ -18,6 +18,12 @@ macro_rules! embedded_library {
         #[cfg(target_os = "tvos")]
         const $name: &[u8] =
             include_bytes!(concat!(env!("OUT_DIR"), "/", $library, "_tvos.metallib"));
+        #[cfg(target_os = "visionos")]
+        const $name: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/", $library, "_visionos.metallib"));
+        #[cfg(target_os = "watchos")]
+        const $name: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/", $library, "_watchos.metallib"));
     };
 }
 
