@@ -214,9 +214,25 @@ pub async fn re_isq(
 /// Request body for applying online calibration.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct CalibrationApplyRequest {
-    /// Optionally save the collected imatrix to this `.cimatrix` path before requantizing.
+    /// Optionally save the collected imatrix to this `.cimatrix` file name in the server's working directory.
     #[serde(default)]
     pub save_cimatrix: Option<String>,
+}
+
+// remote clients only get a bare file name so the write can't leave the working directory
+fn http_save_cimatrix_path(name: &str) -> Result<std::path::PathBuf, ApiError> {
+    let path = std::path::Path::new(name);
+    let bare = !name.contains(['/', '\\'])
+        && matches!(
+            path.components().collect::<Vec<_>>().as_slice(),
+            [std::path::Component::Normal(_)]
+        );
+    if !bare {
+        return Err(ApiError::invalid_request(format!(
+            "`save_cimatrix` must be a bare file name, got `{name}`"
+        )));
+    }
+    Ok(path.to_path_buf())
 }
 
 async fn send_calibration(
@@ -282,12 +298,19 @@ pub async fn calibration_apply(
         Ok(Json(request)) => request,
         Err(error) => return openai_error_response(ApiError::from_json_rejection(error)),
     };
+    let save_cimatrix = match request
+        .save_cimatrix
+        .as_deref()
+        .map(http_save_cimatrix_path)
+        .transpose()
+    {
+        Ok(path) => path,
+        Err(error) => return openai_error_response(error),
+    };
     MistralRs::maybe_log_request(state.clone(), "Calibration apply".to_string());
     send_calibration(
         &state,
-        mistralrs_core::CalibrationAction::Apply {
-            save_cimatrix: request.save_cimatrix.map(std::path::PathBuf::from),
-        },
+        mistralrs_core::CalibrationAction::Apply { save_cimatrix },
     )
     .await
 }
@@ -456,12 +479,6 @@ pub struct TuneModelRequest {
     /// Optional model dtype (auto, f16, bf16, etc)
     #[serde(default)]
     pub dtype: Option<String>,
-    /// Optional max sequence length for tuning
-    #[serde(default)]
-    pub max_seq_len: Option<usize>,
-    /// Optional max batch size for tuning
-    #[serde(default)]
-    pub max_batch_size: Option<usize>,
     /// Optional max num images (multimodal)
     #[serde(default)]
     pub max_num_images: Option<usize>,
@@ -535,13 +552,6 @@ pub async fn tune_model(payload: Result<Json<TuneModelRequest>, JsonRejection>) 
         }
     };
 
-    let max_seq_len = request
-        .max_seq_len
-        .unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN);
-    let max_batch_size = request
-        .max_batch_size
-        .unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE);
-
     let model_selected = ModelSelected::Run {
         model_id: request.model_id.clone(),
         tokenizer_json: None,
@@ -553,8 +563,8 @@ pub async fn tune_model(payload: Result<Json<TuneModelRequest>, JsonRejection>) 
         imatrix: None,
         calibration_file: None,
         max_edge: None,
-        max_seq_len,
-        max_batch_size,
+        max_seq_len: AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN,
+        max_batch_size: AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE,
         max_num_images: request.max_num_images,
         max_image_length: request.max_image_length,
         hf_cache_path: None,
@@ -685,6 +695,23 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn http_save_cimatrix_accepts_only_bare_file_names() {
+        assert!(http_save_cimatrix_path("traffic.cimatrix").is_ok());
+        for name in [
+            "/tmp/pwned.cimatrix",
+            "../../etc/escaped.cimatrix",
+            "subdir/traffic.cimatrix",
+            "subdir\\traffic.cimatrix",
+            "./traffic.cimatrix",
+            "..",
+            ".",
+            "",
+        ] {
+            assert!(http_save_cimatrix_path(name).is_err(), "{name:?}");
+        }
+    }
 
     #[test]
     fn unload_model_results_use_operation_statuses() {

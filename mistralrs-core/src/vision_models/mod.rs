@@ -27,7 +27,9 @@ pub(crate) mod diffusion_gemma;
 pub(crate) mod gemma3;
 pub(crate) mod gemma3n;
 pub(crate) mod gemma4;
+pub(crate) mod grid_processor;
 pub(crate) mod lfm2_vl;
+pub(crate) mod lfm3_vl;
 pub(crate) mod llama4;
 pub(crate) mod mistral3;
 pub(crate) mod multimodal_layout;
@@ -36,6 +38,7 @@ pub(crate) mod qwen3_5;
 pub(crate) mod qwen3_5_moe;
 pub(crate) mod qwen3_vl;
 pub(crate) mod qwen3_vl_moe;
+pub(crate) mod qwen4_exp;
 pub(crate) mod siglip;
 pub(crate) mod voxtral;
 

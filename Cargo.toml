@@ -20,7 +20,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.3"
+version = "0.9.5"
 edition = "2021"
 description = "Fast, flexible LLM inference."
 homepage = "https://github.com/EricLBuehler/mistral.rs"
@@ -34,7 +34,7 @@ rust-version = "1.94"
 # onde-candle-{core,nn} are the upstream candle rev 27f20fea snapshot published to
 # crates.io (mistral.rs needs post-0.11.0 APIs); metal-kernels and flash-attn-v3 are
 # unchanged at that rev, so the official crates serve them. Upstream master has since
-# moved to candle rev 35d7ae7c; we stay on the published snapshot because this fork is
+# moved to candle rev 66a8cf18; we stay on the published snapshot because this fork is
 # released to crates.io and cannot carry git dependencies.
 candle-core = { version = "0.11.0", package = "onde-candle-core" }
 candle-nn = { version = "0.11.0", package = "onde-candle-nn" }
@@ -131,12 +131,11 @@ bytemuck = "1.24.0"
 tokio-rayon = "2.1.0"
 rand_isaac = "0.4.0"
 indicatif = { version = "0.18.3", features = ["rayon"] }
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 strum = { version = "0.27.2", features = ["derive"] }
 derive_more = { version = "2.1.1", default-features = false, features = ["from"] }
 akin = "0.4.0"
 variantly = "0.4.0"
-derive-new = "0.7.0"
 sysinfo = "0.36.1"
 csv = "1.4.0"
 bytemuck_derive = "1.10.2"
@@ -193,21 +192,21 @@ seccompiler = "0.5.0"
 landlock = "0.4.4"
 nix = { version = "0.31.3", default-features = false }
 itoa = "1.0.18"
-cutile = "=0.3.0"
+cutile = "=0.3.1"
 
-mistralrs-core = { path = "mistralrs-core", version = "0.9.3", package = "onde-mistralrs-core" }
-mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.9.3", package = "onde-mistralrs-paged-attn" }
-mistralrs-metal-compile = { path = "mistralrs-metal-compile", version = "0.9.3", package = "onde-mistralrs-metal-compile" }
-mistralrs-flash-attn = { path = "mistralrs-flash-attn", version = "0.9.3", package = "onde-mistralrs-flash-attn" }
-mistralrs-quant = { path = "mistralrs-quant", version = "0.9.3", package = "onde-mistralrs-quant" }
-mistralrs-vision = { path = "mistralrs-vision", version = "0.9.3", package = "onde-mistralrs-vision" }
-mistralrs-server-core = { path = "mistralrs-server-core", version = "0.9.3" }
-mistralrs = { path = "mistralrs", version = "0.9.3", package = "onde-mistralrs" }
-mistralrs-audio = { path = "mistralrs-audio", version = "0.9.3", package = "onde-mistralrs-audio" }
-mistralrs-mcp = { path = "mistralrs-mcp", version = "0.9.3", package = "onde-mistralrs-mcp" }
-mistralrs-macros = { path = "mistralrs-macros", version = "0.9.3", package = "onde-mistralrs-macros" }
-mistralrs-code-exec = { path = "mistralrs-code-exec", version = "0.9.3", package = "onde-mistralrs-code-exec" }
-mistralrs-sandbox = { path = "mistralrs-sandbox", version = "0.9.3", package = "onde-mistralrs-sandbox" }
+mistralrs-core = { path = "mistralrs-core", version = "0.9.5", package = "onde-mistralrs-core" }
+mistralrs-paged-attn = { path = "mistralrs-paged-attn", version = "0.9.5", package = "onde-mistralrs-paged-attn" }
+mistralrs-metal-compile = { path = "mistralrs-metal-compile", version = "0.9.5", package = "onde-mistralrs-metal-compile" }
+mistralrs-flash-attn = { path = "mistralrs-flash-attn", version = "0.9.5", package = "onde-mistralrs-flash-attn" }
+mistralrs-quant = { path = "mistralrs-quant", version = "0.9.5", package = "onde-mistralrs-quant" }
+mistralrs-vision = { path = "mistralrs-vision", version = "0.9.5", package = "onde-mistralrs-vision" }
+mistralrs-server-core = { path = "mistralrs-server-core", version = "0.9.5" }
+mistralrs = { path = "mistralrs", version = "0.9.5", package = "onde-mistralrs" }
+mistralrs-audio = { path = "mistralrs-audio", version = "0.9.5", package = "onde-mistralrs-audio" }
+mistralrs-mcp = { path = "mistralrs-mcp", version = "0.9.5", package = "onde-mistralrs-mcp" }
+mistralrs-macros = { path = "mistralrs-macros", version = "0.9.5", package = "onde-mistralrs-macros" }
+mistralrs-code-exec = { path = "mistralrs-code-exec", version = "0.9.5", package = "onde-mistralrs-code-exec" }
+mistralrs-sandbox = { path = "mistralrs-sandbox", version = "0.9.5", package = "onde-mistralrs-sandbox" }
 
 # Use forked sysctl with watchOS (target_os = "watchos") support until upstream merges it.
 # Upstream PR: https://github.com/johalun/sysctl-rs/pull/XXX

@@ -18,7 +18,7 @@
 
 use anyhow::{bail, Context, Result};
 use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder, DynamicImage};
+use image::{AnimationDecoder, DynamicImage, ImageDecoder, Limits};
 use mistralrs_core::{sample_frame_indices, VideoFrameSampling, VideoInput};
 use std::io::Cursor;
 use std::path::Path;
@@ -30,6 +30,12 @@ use crate::media_source::{
 
 /// Default frames-per-second assumed when metadata is unavailable (e.g. GIF).
 const DEFAULT_FPS: f64 = 24.0;
+
+// every GIF frame is materialized as a full RGBA canvas before sampling
+const MAX_GIF_DIMENSION: u32 = 8192;
+const MAX_GIF_FRAMES: usize = 4096;
+const MAX_DECODED_GIF_BYTES: u64 = 1 << 30;
+const RGBA_BYTES_PER_PIXEL: u64 = 4;
 
 const FFMPEG_INSTALL_HELP: &str = "\
 FFmpeg is required for video input (non-GIF formats). Install it:
@@ -95,30 +101,50 @@ fn is_gif_source(source: &str, media: &LoadedMedia) -> bool {
 
 /// Decode a GIF into frames using the `image` crate.
 fn decode_gif_frames(bytes: &[u8], sampling: Option<VideoFrameSampling>) -> Result<VideoInput> {
-    let decoder = GifDecoder::new(Cursor::new(bytes)).context("Failed to decode GIF")?;
+    let mut decoder = GifDecoder::new(Cursor::new(bytes)).context("Failed to decode GIF")?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_GIF_DIMENSION);
+    limits.max_image_height = Some(MAX_GIF_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_GIF_BYTES);
+    decoder
+        .set_limits(limits)
+        .context("GIF exceeds decode limits")?;
 
-    let raw_frames: Vec<_> = decoder.into_frames().collect::<Result<Vec<_>, _>>()?;
+    let (width, height) = decoder.dimensions();
+    let frame_bytes = u64::from(width) * u64::from(height) * RGBA_BYTES_PER_PIXEL;
+    let max_frames = usize::try_from(MAX_DECODED_GIF_BYTES / frame_bytes.max(1))
+        .unwrap_or(usize::MAX)
+        .min(MAX_GIF_FRAMES);
+    let mut raw_frames = Vec::new();
+    for frame in decoder.into_frames() {
+        if raw_frames.len() == max_frames {
+            bail!(
+                "GIF exceeds the {max_frames} frame decode limit for its {width}x{height} canvas"
+            );
+        }
+        raw_frames.push(frame?);
+    }
     let total = raw_frames.len();
     if total == 0 {
         bail!("GIF contains no frames");
     }
 
     // Estimate FPS from average frame delay
-    let total_delay_ms: u32 = raw_frames
+    let total_delay_ms: f64 = raw_frames
         .iter()
         .map(|f| {
             let (num, den) = f.delay().numer_denom_ms();
-            (num * 1000).checked_div(den).unwrap_or(100)
+            f64::from(num) / f64::from(den)
         })
         .sum();
-    let fps = if total_delay_ms > 0 {
-        (total as f64 * 1000.0) / total_delay_ms as f64
+    let fps = if total_delay_ms > 0.0 {
+        (total as f64 * 1000.0) / total_delay_ms
     } else {
         DEFAULT_FPS
     };
 
     let indices = sampling
-        .map(|sampling| sample_frame_indices(total, sampling.target_frames(total, fps)))
+        .map(|sampling| sampling.sample_indices(total, sampling.target_frames(total, fps)))
         .unwrap_or_else(|| (0..total).collect());
     let frames: Vec<DynamicImage> = indices
         .iter()
@@ -183,7 +209,9 @@ async fn decode_video_ffmpeg(
         } else {
             match sampling {
                 VideoFrameSampling::Uniform(count) => count,
-                VideoFrameSampling::Fps { .. } => SERVER_VIDEO_FRAME_LIMIT,
+                VideoFrameSampling::Fps { .. } | VideoFrameSampling::FpsInclusive { .. } => {
+                    SERVER_VIDEO_FRAME_LIMIT
+                }
             }
         };
         let effective_total = if total_frames > 0 {
@@ -191,7 +219,7 @@ async fn decode_video_ffmpeg(
         } else {
             num_frames
         };
-        let indices = sample_frame_indices(effective_total, num_frames);
+        let indices = sampling.sample_indices(effective_total, num_frames);
         let select_expr = indices
             .iter()
             .map(|i| format!("eq(n\\,{i})"))
@@ -371,6 +399,69 @@ fn parse_fps_fraction(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GIF_HEADER: &[u8] = b"GIF89a";
+    const GIF_SCREEN_TAIL: &[u8] = &[0x80, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff];
+    const GIF_1X1_FRAME: &[u8] = &[0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0x02, 0x02, 0x44, 0x01, 0];
+    const GIF_TRAILER: u8 = 0x3b;
+
+    fn gif(width: u16, height: u16, frames: usize) -> Vec<u8> {
+        let mut bytes = GIF_HEADER.to_vec();
+        bytes.extend(width.to_le_bytes());
+        bytes.extend(height.to_le_bytes());
+        bytes.extend(GIF_SCREEN_TAIL);
+        for _ in 0..frames {
+            bytes.extend(GIF_1X1_FRAME);
+        }
+        bytes.push(GIF_TRAILER);
+        bytes
+    }
+
+    #[test]
+    fn gif_decodes_within_limits() {
+        let video = decode_gif_frames(&gif(1, 1, 3), None).unwrap();
+        assert_eq!(video.total_num_frames, 3);
+    }
+
+    #[test]
+    fn gif_sampling_preserves_fps_and_endpoint_timestamps() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut encoded);
+            for _ in 0..10 {
+                encoder
+                    .encode_frame(image::Frame::from_parts(
+                        image::RgbaImage::new(1, 1),
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(100, 1),
+                    ))
+                    .unwrap();
+            }
+        }
+        let video = decode_gif_frames(
+            &encoded,
+            Some(VideoFrameSampling::FpsInclusive {
+                fps: 2.0,
+                min_frames: 4,
+                max_frames: 768,
+            }),
+        )
+        .unwrap();
+        assert_eq!(video.fps, 10.0);
+        assert_eq!(video.sampled_indices, vec![0, 3, 6, 9]);
+        assert_eq!(video.timestamps_secs(), vec![0.0, 0.3, 0.6, 0.9]);
+    }
+
+    #[test]
+    fn gif_rejects_oversized_canvas() {
+        assert!(decode_gif_frames(&gif(u16::MAX, u16::MAX, 1), None).is_err());
+    }
+
+    #[test]
+    fn gif_rejects_too_many_frames() {
+        assert!(decode_gif_frames(&gif(1, 1, MAX_GIF_FRAMES + 1), None).is_err());
+    }
 
     #[test]
     fn test_parse_fps_fraction() {

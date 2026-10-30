@@ -1,3 +1,6 @@
+#[cfg(feature = "metal")]
+include!("src/metal/kernels/source_set.rs");
+
 #[cfg(feature = "cuda")]
 const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 #[cfg(feature = "cuda")]
@@ -20,6 +23,19 @@ fn cuda_build_dir(out_dir: &std::path::Path, component: &str) -> std::path::Path
     let build_dir = std::path::PathBuf::from(root).join("core").join(component);
     std::fs::create_dir_all(&build_dir).expect("failed to create shared CUDA build directory");
     build_dir
+}
+
+#[cfg(feature = "cuda")]
+fn prepare_cuda_archive(path: std::path::PathBuf) -> std::path::PathBuf {
+    if std::env::var_os(CUDA_BUILD_ROOT_ENV).is_some() {
+        // Shared objects can be newer than this Cargo build directory's archive.
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to refresh CUDA archive {}: {error}", path.display()),
+        }
+    }
+    path
 }
 
 #[cfg(feature = "cuda")]
@@ -62,6 +78,12 @@ fn cuda_header_hash(dir: &std::path::Path) -> std::io::Result<u64> {
 
 fn main() {
     set_git_revision();
+
+    #[cfg(feature = "metal")]
+    for source_set in [&GDN_METAL_SOURCE_SET, &SSM_METAL_SOURCE_SET] {
+        mistralrs_metal_compile::compile_metallibs(source_set)
+            .expect("failed to precompile recurrent Metal kernels");
+    }
 
     println!("cargo::rustc-check-cfg=cfg(has_flashinfer_gdn_sm90_kernel)");
     println!("cargo::rustc-check-cfg=cfg(has_gdn_fp8_producer)");
@@ -138,7 +160,7 @@ fn main() {
         };
 
         builder
-            .build_lib(out_file)
+            .build_lib(prepare_cuda_archive(out_file))
             .expect("Build mistral-core failed!");
         println!("cargo:rustc-link-search={}", out_dir.display());
         println!("cargo:rustc-link-lib=mistralrscuda");
@@ -186,7 +208,9 @@ fn main() {
                     .arg(cuda_nvcc_flags_env);
             }
             flashinfer_gdn
-                .build_lib(out_dir.join("libmistralrsflashinfergdn.a"))
+                .build_lib(prepare_cuda_archive(
+                    out_dir.join("libmistralrsflashinfergdn.a"),
+                ))
                 .expect("Build FlashInfer GDN provider failed!");
             println!("cargo:rustc-link-lib=mistralrsflashinfergdn");
         } else if compute_cap == 90

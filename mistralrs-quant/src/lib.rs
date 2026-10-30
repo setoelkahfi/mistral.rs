@@ -12,19 +12,26 @@ use candle_core::{
 };
 
 #[cfg(feature = "metal")]
+mod metal_fp8;
+#[cfg(feature = "metal")]
 pub mod metal_kernels;
 
 mod afq;
 mod bitsandbytes;
 mod blockwise_fp8;
+mod cpu_rms_norm;
 pub mod cublaslt;
 #[cfg(test)]
 #[path = "build_support/cuda_headers.rs"]
 mod cuda_headers;
+#[cfg(test)]
+#[path = "build_support/cuda_toolkit.rs"]
+mod cuda_toolkit;
 #[cfg(all(feature = "cuda", feature = "cutile"))]
 pub mod cutile;
 pub mod distributed;
 mod dummy;
+pub mod elementwise;
 pub mod f8q8;
 mod fp8;
 mod fp8_config;
@@ -34,10 +41,13 @@ mod gptq;
 mod hqq;
 mod imatrix;
 mod isq_executor;
+mod lfm3_conv;
+pub mod lfm3_spatial_conv;
 mod lora;
 #[cfg(feature = "cuda")]
 pub mod moe;
 mod mxfp4;
+pub mod nvfp4;
 mod pending_layer;
 mod pertensor_fp8;
 pub mod rotary;
@@ -48,7 +58,9 @@ mod uqff;
 mod utils;
 mod vector_fp8;
 
+pub use cpu_rms_norm::cpu_rms_norm;
 use gptq::gptq_linear;
+pub use lfm3_conv::lfm3_causal_conv1d;
 use regex::Regex;
 pub use safetensors::{Shard, ShardedSafeTensors, TensorShapes};
 pub use uqff::{
@@ -80,6 +92,19 @@ pub trait QuantizedWeightSource: Send + Sync {
     fn pack_factor(&self, dtype: DType) -> Result<usize>;
 
     fn pack_factor_for(&self, key: &str, dtype: DType) -> Result<Option<usize>>;
+
+    /// Exact resident bytes of the bound weights, when the source knows them; device mapping
+    /// falls back to the pack-factor estimate otherwise.
+    fn resident_layer_bytes(&self, _dtype: DType) -> Result<Option<ResidentLayerBytes>> {
+        Ok(None)
+    }
+}
+
+/// Resident weight bytes per text layer, plus everything outside the repeating layers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResidentLayerBytes {
+    pub layers: std::collections::BTreeMap<usize, usize>,
+    pub outside: usize,
 }
 
 impl<T: QuantizedWeightSource + ?Sized> QuantizedWeightSource for Arc<T> {
@@ -111,6 +136,10 @@ impl<T: QuantizedWeightSource + ?Sized> QuantizedWeightSource for Arc<T> {
     fn pack_factor_for(&self, key: &str, dtype: DType) -> Result<Option<usize>> {
         (**self).pack_factor_for(key, dtype)
     }
+
+    fn resident_layer_bytes(&self, dtype: DType) -> Result<Option<ResidentLayerBytes>> {
+        (**self).resident_layer_bytes(dtype)
+    }
 }
 
 /// Bytes the packed-affine (Marlin layout) GGUF weights will occupy on this device.
@@ -129,10 +158,22 @@ pub fn gguf_affine_budget_bytes(device: &Device, dtype: DType) -> usize {
     }
 }
 
+pub fn gguf_affine_reserved_bytes(device: &Device, dtype: DType) -> usize {
+    #[cfg(all(feature = "cuda", has_marlin_kernels))]
+    {
+        gguf::gguf_affine_reserved_bytes(device, dtype)
+    }
+    #[cfg(not(all(feature = "cuda", has_marlin_kernels)))]
+    {
+        let _ = (device, dtype);
+        0
+    }
+}
+
 #[cfg(feature = "metal")]
 pub use afq::ops::{
-    afq_gather_qmm_rhs_sorted, afq_gather_qmm_rhs_sorted_gate_up, metal_arg_sort_u32_1d,
-    metal_moe_weighted_reduce_flat,
+    afq_gather_qmm_rhs_sorted, afq_gather_qmm_rhs_sorted_gate_up, afq_sorted_gather_supported,
+    metal_arg_sort_u32_1d, metal_moe_weighted_reduce_flat,
 };
 pub use afq::{AfqBits, AfqGroupSize, AfqInner, AfqLayer};
 pub use bitsandbytes::{BnbLinear, BnbQuantParams, BnbQuantType};
@@ -153,8 +194,9 @@ pub use dummy::{DummyLayer, DummyLayerInfo};
 pub use f8q8::F8Q8Linear;
 pub use fp8::FP8Linear;
 pub use fp8_config::{
-    Fp8ActivationMode, Fp8CheckpointDialect, Fp8Config, Fp8LinearSpec, Fp8ScaleNames,
-    Fp8WeightScaleLayout,
+    CheckpointDialect, CheckpointLinearSpec, CheckpointQuantConfig, Fp8ActivationMode,
+    Fp8LinearSpec, Fp8ScaleNames, Fp8WeightScaleLayout, Nvfp4ActivationMode, Nvfp4LinearSpec,
+    Nvfp4ScaleNames, ScaleConvention, NVFP4_BLOCK_SIZE,
 };
 #[cfg(feature = "cuda")]
 pub use gemv::gemv;
@@ -211,6 +253,7 @@ pub use lora::{
     RoutedLoraCudaWeightTable, RoutedLoraDirectLaunch, RoutedLoraGroupedLaunch,
 };
 pub use mxfp4::MXFP4Layer;
+pub use nvfp4::{Nvfp4InputCalibration, Nvfp4Layer, Nvfp4LayerParts};
 pub use pending_layer::{pending_isq_channel, PendingIsqLayer};
 pub use pertensor_fp8::{fp8_w8a16_linear, fp8_w8a8_linear, Fp8W8A8LinearArgs, PerTensorFP8Linear};
 pub use unquantized::UnquantLinear;
@@ -522,14 +565,14 @@ pub enum QuantizedConfig {
     #[serde(rename = "compressed-tensors")]
     CompressedTensors {
         #[serde(skip_serializing)]
-        config: Fp8Config,
+        config: CheckpointQuantConfig,
         #[serde(flatten)]
         raw: serde_json::Map<String, serde_json::Value>,
     },
     #[serde(rename = "modelopt")]
     ModelOpt {
         #[serde(skip_serializing)]
-        config: Fp8Config,
+        config: CheckpointQuantConfig,
         #[serde(flatten)]
         raw: serde_json::Map<String, serde_json::Value>,
     },
@@ -601,7 +644,7 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
                         modules_to_not_convert.push(module);
                     }
                 }
-                Fp8Config::native(
+                CheckpointQuantConfig::native(
                     raw.weight_block_size.as_deref(),
                     raw.activation_scheme,
                     raw.fmt.as_deref(),
@@ -617,14 +660,14 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
             }
             Some(m) if m == "compressed-tensors" || m == "compressed_tensors" => {
                 Ok(QuantizedConfig::CompressedTensors {
-                    config: Fp8Config::compressed_tensors(&value)
+                    config: CheckpointQuantConfig::compressed_tensors(&value)
                         .map_err(serde::de::Error::custom)?,
                     raw: raw_quantization_config(&value).map_err(serde::de::Error::custom)?,
                 })
             }
             Some(m) if m.to_ascii_lowercase().starts_with("modelopt") => {
                 Ok(QuantizedConfig::ModelOpt {
-                    config: Fp8Config::model_opt(&value).map_err(serde::de::Error::custom)?,
+                    config: CheckpointQuantConfig::model_opt(&value).map_err(serde::de::Error::custom)?,
                     raw: raw_quantization_config(&value).map_err(serde::de::Error::custom)?,
                 })
             }
@@ -645,7 +688,7 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
             }
             None if value.get("config_groups").is_some() => {
                 Ok(QuantizedConfig::CompressedTensors {
-                    config: Fp8Config::compressed_tensors(&value)
+                    config: CheckpointQuantConfig::compressed_tensors(&value)
                         .map_err(serde::de::Error::custom)?,
                     raw: raw_quantization_config(&value).map_err(serde::de::Error::custom)?,
                 })
@@ -671,7 +714,7 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
 impl QuantizedConfig {
     pub fn from_modelopt_config(config: &serde_json::Value) -> std::result::Result<Self, String> {
         Ok(Self::ModelOpt {
-            config: Fp8Config::model_opt(config)?,
+            config: CheckpointQuantConfig::model_opt(config)?,
             raw: raw_quantization_config(config)?,
         })
     }
@@ -680,21 +723,21 @@ impl QuantizedConfig {
         embedded: Option<&serde_json::Value>,
         external: &serde_json::Value,
     ) -> std::result::Result<Self, String> {
-        let merged = Fp8Config::model_opt_merged_value(embedded, external)?;
+        let merged = CheckpointQuantConfig::model_opt_merged_value(embedded, external)?;
         Ok(Self::ModelOpt {
-            config: Fp8Config::model_opt(&merged)?,
+            config: CheckpointQuantConfig::model_opt(&merged)?,
             raw: raw_quantization_config(&merged)?,
         })
     }
 
-    pub fn resolve_fp8(&self, prefix: &str) -> Result<Option<Fp8LinearSpec>> {
+    pub fn resolve_checkpoint(&self, prefix: &str) -> Result<Option<CheckpointLinearSpec>> {
         match self {
             Self::Fp8 {
                 weight_block_size,
                 activation_scheme,
                 fmt,
                 modules_to_not_convert,
-            } => Fp8Config::native(
+            } => CheckpointQuantConfig::native(
                 weight_block_size.as_deref(),
                 *activation_scheme,
                 fmt.as_deref(),
@@ -710,6 +753,16 @@ impl QuantizedConfig {
         }
     }
 
+    pub fn resolve_fp8(&self, prefix: &str) -> Result<Option<Fp8LinearSpec>> {
+        match self.resolve_checkpoint(prefix)? {
+            Some(CheckpointLinearSpec::Fp8(spec)) => Ok(Some(spec)),
+            Some(CheckpointLinearSpec::Nvfp4(_)) => {
+                candle_core::bail!("NVFP4 layer `{prefix}` requires the NVFP4 loader")
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::GptqAwq { .. } => "gptq",
@@ -722,11 +775,17 @@ impl QuantizedConfig {
         }
     }
 
-    pub fn get_bits_name(&self, _vb: &ShardedVarBuilder) -> String {
+    pub fn get_bits_name(&self, vb: &ShardedVarBuilder) -> String {
         match self {
             Self::GptqAwq { bits, .. } => format!("{bits} bits"),
             Self::Fp8 { .. } => "8 bits".to_string(),
-            Self::CompressedTensors { .. } | Self::ModelOpt { .. } => "8 bits".to_string(),
+            Self::CompressedTensors { .. } | Self::ModelOpt { .. } => {
+                match self.resolve_checkpoint(&vb.prefix()) {
+                    Ok(Some(CheckpointLinearSpec::Nvfp4(_))) => "4 bits".to_string(),
+                    Ok(Some(CheckpointLinearSpec::Fp8(_))) => "8 bits".to_string(),
+                    _ => "unquantized".to_string(),
+                }
+            }
             Self::Bitsandbytes {
                 bnb_4bit_quant_type: Some(_),
             } => "4 bits".to_string(),
@@ -751,9 +810,7 @@ impl QuantizedConfig {
                 other => panic!("Unexpected bits in `pack_factor` {other}"),
             },
             Self::Fp8 { .. } => IsqType::F8E4M3.pack_factor(dtype),
-            Self::CompressedTensors { .. } | Self::ModelOpt { .. } => {
-                IsqType::F8E4M3.pack_factor(dtype)
-            }
+            Self::CompressedTensors { .. } | Self::ModelOpt { .. } => 1,
             Self::Bitsandbytes {
                 bnb_4bit_quant_type: Some(_),
             } => IsqType::Q4K.pack_factor(dtype),
@@ -1556,6 +1613,7 @@ pub struct QuantizedActivation {
     source_dtype: DType,
     scheme: ActivationQuantizationScheme,
     scale_layout: ActivationScaleLayout,
+    global_scale: Option<f32>,
 }
 
 impl QuantizedActivation {
@@ -1646,7 +1704,53 @@ impl QuantizedActivation {
             source_dtype,
             scheme,
             scale_layout,
+            global_scale: None,
         })
+    }
+
+    pub fn new_nvfp4(
+        quantized: Tensor,
+        scales: Tensor,
+        source: &Tensor,
+        global_scale: f32,
+    ) -> Result<Self> {
+        if source.rank() < 2 || !matches!(source.dtype(), DType::BF16 | DType::F16) {
+            candle_core::bail!("NVFP4 activation source must be rank >= 2 and BF16 or F16");
+        }
+        let columns = source.dim(candle_core::D::Minus1)?;
+        if columns == 0 || !columns.is_multiple_of(NVFP4_BLOCK_SIZE) {
+            candle_core::bail!(
+                "NVFP4 activation columns must be a nonzero multiple of {NVFP4_BLOCK_SIZE}"
+            );
+        }
+        let rows = source.elem_count() / columns;
+        if quantized.dtype() != DType::U8 || quantized.dims() != [rows, columns / 2] {
+            candle_core::bail!("NVFP4 activation values must be packed U8 [rows, columns / 2]");
+        }
+        if scales.dtype() != DType::F8E4M3 || scales.dims() != [rows, columns / NVFP4_BLOCK_SIZE] {
+            candle_core::bail!("NVFP4 activation block scales must be E4M3 [rows, columns / 16]");
+        }
+        if !quantized.device().same_device(source.device())
+            || !scales.device().same_device(source.device())
+        {
+            candle_core::bail!("NVFP4 activation tensors must be on the same device");
+        }
+        if !global_scale.is_finite() || global_scale <= 0.0 {
+            candle_core::bail!("NVFP4 activation global scale must be finite and positive");
+        }
+        Ok(Self {
+            quantized,
+            scales,
+            source_shape: source.dims().to_vec(),
+            source_dtype: source.dtype(),
+            scheme: nvfp4::NVFP4_ACTIVATION_SCHEME,
+            scale_layout: ActivationScaleLayout::RowMajor,
+            global_scale: Some(global_scale),
+        })
+    }
+
+    pub fn global_scale(&self) -> Option<f32> {
+        self.global_scale
     }
 
     pub fn quantized(&self) -> &Tensor {
@@ -1725,6 +1829,11 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
         Self: Sized;
 
     fn dequantize_w(&self) -> Result<Tensor>;
+
+    #[cfg(feature = "metal")]
+    fn prepare_metal_kernels(&self, _activation_dtype: DType) -> Result<()> {
+        Ok(())
+    }
 
     /// Compute matmul of `self` and `a`. `self` should contain the weights.
     /// Automatically casts to the required quantization activation type and back.
@@ -1821,6 +1930,15 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
             .map(|_| ActivationScaleLayout::RowMajor)
     }
 
+    #[doc(hidden)]
+    fn nvfp4_input_calibration(&self) -> Option<Nvfp4InputCalibration<'_>> {
+        None
+    }
+
+    fn activation_quantization_global_scale(&self) -> Option<f32> {
+        None
+    }
+
     fn quantize_activation(&self, _a: &Tensor) -> Result<QuantizedActivation> {
         candle_core::bail!("{} does not support activation quantization", self.name())
     }
@@ -1830,6 +1948,15 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
             "{} does not support prequantized activation input",
             self.name()
         )
+    }
+
+    fn try_quantize_glu(
+        &self,
+        _gate: &Tensor,
+        _value: &Tensor,
+        _activation: GluActivationType,
+    ) -> Result<Option<QuantizedActivation>> {
+        Ok(None)
     }
 
     #[cfg(feature = "cuda")]
@@ -1925,12 +2052,26 @@ pub fn try_forward_with_shared_quantized_activation(
     if first.preferred_activation_scale_layout_for(a) != Some(ActivationScaleLayout::RowMajor) {
         return Ok(None);
     }
+    let global_scale = first.activation_quantization_global_scale();
     if methods.iter().skip(1).any(|method| {
         method.activation_quantization_scheme_for(a) != Some(scheme)
+            || method.activation_quantization_global_scale() != global_scale
             || method.preferred_activation_scale_layout_for(a)
                 != Some(ActivationScaleLayout::RowMajor)
     }) {
         return Ok(None);
+    }
+    if scheme == nvfp4::NVFP4_ACTIVATION_SCHEME {
+        let Some(calibration) = first.nvfp4_input_calibration() else {
+            return Ok(None);
+        };
+        if methods.iter().skip(1).any(|method| {
+            method
+                .nvfp4_input_calibration()
+                .is_none_or(|other| !calibration.matches(other))
+        }) {
+            return Ok(None);
+        }
     }
     let activation = first.quantize_activation(a)?;
     if activation.scheme() != scheme {
@@ -1939,6 +2080,11 @@ pub fn try_forward_with_shared_quantized_activation(
             first.name(),
             activation.scheme(),
             scheme
+        );
+    }
+    if activation.global_scale() != global_scale {
+        candle_core::bail!(
+            "shared activation quantizer returned a different calibrated global scale"
         );
     }
     if activation.scale_layout() != ActivationScaleLayout::RowMajor {
@@ -1963,14 +2109,20 @@ pub fn try_forward_fused_quantized_glu(
 ) -> Result<Option<Tensor>> {
     #[cfg(feature = "cuda")]
     {
-        if gate.dtype() != DType::BF16
-            || value.dtype() != DType::BF16
+        if !matches!(gate.dtype(), DType::BF16 | DType::F16)
+            || gate.dtype() != value.dtype()
             || gate.shape() != value.shape()
             || !gate.device().same_device(value.device())
             || !gate.device().is_cuda()
             || projection.is_dynamic_lora_active()
             || projection.stats_snapshot().is_some()
         {
+            return Ok(None);
+        }
+        if let Some(quantized) = projection.try_quantize_glu(gate, value, activation)? {
+            return projection.forward_quantized(&quantized).map(Some);
+        }
+        if gate.dtype() != DType::BF16 {
             return Ok(None);
         }
         let Some(scheme) = projection.activation_quantization_scheme_for(value) else {
@@ -2063,6 +2215,10 @@ pub fn try_fused_quantized_ffn(
         let [gate_out, up_out]: [Tensor; 2] = outputs.try_into().map_err(|_| {
             candle_core::Error::msg("shared gate/up projection returned the wrong output count")
         })?;
+        if let Some(output) = try_forward_fused_quantized_glu(&gate_out, &up_out, down, activation)?
+        {
+            return Ok(Some(output));
+        }
         let intermediate = fused_glu(&gate_out, &up_out, activation)?;
         return Ok(Some(down.forward(&intermediate)?));
     }
@@ -2338,8 +2494,82 @@ pub fn try_fused_quantized_qkv(
     }
 }
 
+/// Shared preconditions for every fused multi-projection kernel, on every backend: bias-free projections
+/// that are not collecting imatrix stats (fused kernels skip `forward`) or running dynamic LoRA, and a float
+/// activation. Per-backend functions then add their format and shape rules.
+fn fused_projections_allowed(xs: &Tensor, projections: &[&dyn QuantMethod]) -> bool {
+    matches!(xs.dtype(), DType::BF16 | DType::F16 | DType::F32)
+        && projections
+            .iter()
+            .all(|p| !p.has_bias() && p.stats_snapshot().is_none() && !p.is_dynamic_lora_active())
+}
+
+/// Fused gate + up + GLU + down, where a backend has a kernel for these weights.
+#[allow(unused_variables)]
+pub fn try_fused_ffn(
+    xs: &Tensor,
+    gate: &dyn QuantMethod,
+    up: &dyn QuantMethod,
+    down: &dyn QuantMethod,
+    activation: GluActivationType,
+) -> Result<Option<Tensor>> {
+    if !fused_projections_allowed(xs, &[gate, up, down]) {
+        return Ok(None);
+    }
+    #[cfg(feature = "cuda")]
+    if xs.device().is_cuda() {
+        return try_fused_quantized_ffn(xs, gate, up, down, activation);
+    }
+    Ok(None)
+}
+
+/// Fused gate + up + GLU, where a backend has a kernel for these weights.
+#[allow(unused_variables)]
+pub fn try_fused_gate_up(
+    xs: &Tensor,
+    gate: &dyn QuantMethod,
+    up: &dyn QuantMethod,
+    activation: GluActivationType,
+) -> Result<Option<Tensor>> {
+    if !fused_projections_allowed(xs, &[gate, up]) {
+        return Ok(None);
+    }
+    #[cfg(feature = "cuda")]
+    if xs.device().is_cuda() {
+        return try_fused_quantized_gate_up(xs, gate, up, activation);
+    }
+    #[cfg(feature = "metal")]
+    if xs.device().is_metal() {
+        return try_fused_gate_up_metal(xs, gate, up, activation);
+    }
+    Ok(None)
+}
+
+/// Fused Q/K/V projections, where a backend has a kernel for these weights.
+#[allow(unused_variables)]
+pub fn try_fused_qkv(
+    xs: &Tensor,
+    q: &dyn QuantMethod,
+    k: &dyn QuantMethod,
+    v: &dyn QuantMethod,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    if !fused_projections_allowed(xs, &[q, k, v]) {
+        return Ok(None);
+    }
+    #[cfg(feature = "cuda")]
+    if xs.device().is_cuda() {
+        return try_fused_quantized_qkv(xs, q, k, v);
+    }
+    #[cfg(feature = "metal")]
+    if xs.device().is_metal() {
+        return try_fused_qkv_metal(xs, q, k, v);
+    }
+    Ok(None)
+}
+
 /// Metal fused gate+up: single Metal kernel that does both matmuls with shared
 /// x reads and applies the GLU activation in-register before writing one output.
+/// Callers go through [`try_fused_gate_up`], which applies the shared preconditions.
 #[cfg(feature = "metal")]
 pub fn try_fused_gate_up_metal(
     xs: &Tensor,
@@ -2349,12 +2579,6 @@ pub fn try_fused_gate_up_metal(
 ) -> Result<Option<Tensor>> {
     use candle_core::{backend::BackendStorage, MetalStorage, Shape, Storage};
 
-    if gate.has_bias() || up.has_bias() {
-        return Ok(None);
-    }
-    if !matches!(xs.dtype(), DType::BF16 | DType::F16 | DType::F32) {
-        return Ok(None);
-    }
     if !xs.device().is_metal() {
         return Ok(None);
     }
@@ -2483,6 +2707,7 @@ pub fn try_fused_gate_up_metal(
 
 /// Metal fused QKV: single Metal kernel that handles all three projections,
 /// routing per-tile to the right weight matrix.
+/// Callers go through [`try_fused_qkv`], which applies the shared preconditions.
 #[cfg(feature = "metal")]
 pub fn try_fused_qkv_metal(
     xs: &Tensor,
@@ -2492,12 +2717,6 @@ pub fn try_fused_qkv_metal(
 ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
     use candle_core::{backend::BackendStorage, MetalStorage, Shape, Storage};
 
-    if q.has_bias() || k.has_bias() || v.has_bias() {
-        return Ok(None);
-    }
-    if !matches!(xs.dtype(), DType::BF16 | DType::F16 | DType::F32) {
-        return Ok(None);
-    }
     if !xs.device().is_metal() {
         return Ok(None);
     }
@@ -2728,7 +2947,7 @@ pub fn linear_no_bias(
             QuantizedConfig::GptqAwq { .. } => gptq_linear(in_dim, out_dim, quant_conf, vb)?,
             QuantizedConfig::Fp8 { .. }
             | QuantizedConfig::CompressedTensors { .. }
-            | QuantizedConfig::ModelOpt { .. } => fp8_config::fp8_checkpoint_linear_b(
+            | QuantizedConfig::ModelOpt { .. } => fp8_config::checkpoint_linear_b(
                 in_dim,
                 out_dim,
                 quant_conf,
@@ -2794,7 +3013,7 @@ pub fn linear(
             QuantizedConfig::GptqAwq { .. } => gptq_linear(in_dim, out_dim, quant_conf, vb)?,
             QuantizedConfig::Fp8 { .. }
             | QuantizedConfig::CompressedTensors { .. }
-            | QuantizedConfig::ModelOpt { .. } => fp8_config::fp8_checkpoint_linear_b(
+            | QuantizedConfig::ModelOpt { .. } => fp8_config::checkpoint_linear_b(
                 in_dim,
                 out_dim,
                 quant_conf,
@@ -2851,7 +3070,7 @@ mod tests {
     use super::*;
 
     #[derive(Debug)]
-    struct SharedActivationProbe;
+    struct SharedActivationProbe(Option<f32>);
 
     impl QuantizedSerde for SharedActivationProbe {
         fn name(&self) -> &'static str {
@@ -2861,7 +3080,7 @@ mod tests {
 
     impl QuantMethod for SharedActivationProbe {
         fn new(_method: QuantMethodConfig) -> Result<Self> {
-            Ok(Self)
+            Ok(Self(None))
         }
 
         fn dequantize_w(&self) -> Result<Tensor> {
@@ -2877,6 +3096,10 @@ mod tests {
                 dtype: DType::F8E4M3,
                 block_shape: [1, 4],
             })
+        }
+
+        fn activation_quantization_global_scale(&self) -> Option<f32> {
+            self.0
         }
 
         fn quantize_activation(&self, _a: &Tensor) -> Result<QuantizedActivation> {
@@ -2912,10 +3135,53 @@ mod tests {
     }
 
     #[test]
+    fn shared_activation_requires_matching_global_calibration() -> Result<()> {
+        let input = Tensor::zeros((2, 4), DType::BF16, &Device::Cpu)?;
+        let first = SharedActivationProbe(Some(0.25));
+        let second = SharedActivationProbe(Some(0.5));
+        assert!(
+            try_forward_with_shared_quantized_activation(&input, &[&first, &second])?.is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn packed_nvfp4_activation_keeps_logical_shape_and_rejects_wrong_scales() -> Result<()> {
+        const ROWS: usize = 2;
+        let source = Tensor::zeros((ROWS, 1, NVFP4_BLOCK_SIZE), DType::BF16, &Device::Cpu)?;
+        let packed = Tensor::zeros((ROWS, NVFP4_BLOCK_SIZE / 2), DType::U8, &Device::Cpu)?;
+        let scales = Tensor::ones((ROWS, 1), DType::F8E4M3, &Device::Cpu)?;
+        let activation =
+            QuantizedActivation::new_nvfp4(packed.clone(), scales.clone(), &source, 0.25)?;
+        assert_eq!(activation.source_shape(), source.dims());
+        assert_eq!(activation.quantized().dims(), &[ROWS, NVFP4_BLOCK_SIZE / 2]);
+        assert_eq!(activation.global_scale(), Some(0.25));
+        assert!(QuantizedActivation::new_nvfp4(
+            packed.clone(),
+            scales.to_dtype(DType::F32)?,
+            &source,
+            0.25
+        )
+        .is_err());
+        assert!(QuantizedActivation::new_nvfp4(packed, scales, &source, f32::NAN).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn shared_activation_falls_back_for_unsupported_input_dtype() -> Result<()> {
         let input = Tensor::zeros((1, 4), DType::F32, &Device::Cpu)?;
-        let method = SharedActivationProbe;
+        let method = SharedActivationProbe(None);
         assert!(try_forward_with_shared_quantized_activation(&input, &[&method])?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fused_glu_quantization_defaults_to_fallback() -> Result<()> {
+        let input = Tensor::zeros((2, 16), DType::BF16, &Device::Cpu)?;
+        let method = SharedActivationProbe(None);
+        assert!(method
+            .try_quantize_glu(&input, &input, GluActivationType::Relu)?
+            .is_none());
         Ok(())
     }
 
@@ -2923,7 +3189,7 @@ mod tests {
     fn fused_quantized_glu_falls_back_off_cuda() -> Result<()> {
         let gate = Tensor::zeros((3, 4), DType::BF16, &Device::Cpu)?;
         let value = Tensor::ones((3, 4), DType::BF16, &Device::Cpu)?;
-        let method = SharedActivationProbe;
+        let method = SharedActivationProbe(None);
         assert!(try_forward_fused_quantized_glu(
             &gate,
             &value,
@@ -3718,6 +3984,53 @@ mod tests {
 
         linear_no_bias(2, 3, &None, vb)?;
         assert_eq!(&*load_devices.lock().unwrap(), &[true, false]);
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod fused_projection_metal_tests {
+    use candle_core::{DType, Device, Result, Tensor};
+
+    use crate::{
+        try_fused_gate_up, AfqBits, AfqGroupSize, AfqLayer, GluActivationType, QuantMethod,
+        QuantMethodConfig,
+    };
+
+    fn afq(device: &Device, out: usize, inp: usize, seed: f64) -> Result<AfqLayer> {
+        let weight =
+            (Tensor::randn(0f32, 1., (out, inp), device)? * seed)?.to_dtype(DType::BF16)?;
+        AfqLayer::new(QuantMethodConfig::Afq {
+            weight,
+            bias: None,
+            bits: AfqBits::Four,
+            group_size: AfqGroupSize::Med,
+        })
+    }
+
+    #[test]
+    fn fused_gate_up_matches_separate_and_steps_aside_while_collecting_stats() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let (rows, hidden, inter) = (32, 512, 1024);
+        let gate = afq(&device, inter, hidden, 0.05)?;
+        let up = afq(&device, inter, hidden, 0.07)?;
+        let xs = Tensor::randn(0f32, 1., (1, rows, hidden), &device)?.to_dtype(DType::BF16)?;
+
+        let fused = try_fused_gate_up(&xs, &gate, &up, GluActivationType::Silu)?
+            .expect("AFQ gate/up at 32 rows fuses on Metal");
+        let reference = (candle_nn::ops::silu(&gate.forward(&xs)?)? * up.forward(&xs)?)?;
+        let reference = reference.to_dtype(DType::F32)?;
+        let rel = ((fused.to_dtype(DType::F32)? - &reference)?.abs()?
+            / reference.abs()?.maximum(0.05)?)?
+        .max_all()?
+        .to_scalar::<f32>()?;
+        assert!(rel < 3e-2, "fused gate/up relative error {rel}");
+
+        gate.begin_track_stats()?;
+        assert!(
+            try_fused_gate_up(&xs, &gate, &up, GluActivationType::Silu)?.is_none(),
+            "fusion must step aside so imatrix stats see every input"
+        );
         Ok(())
     }
 }

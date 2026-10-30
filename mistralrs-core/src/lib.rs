@@ -87,6 +87,7 @@ pub mod layers;
 mod layers_masker;
 mod layers_utils;
 pub mod matformer;
+pub mod memory_plan;
 mod mla;
 pub mod model_metadata;
 mod models;
@@ -95,12 +96,14 @@ mod perf_flags;
 mod pipeline;
 mod prefix_cacher;
 pub mod reasoning_parsers;
+pub mod remote_fetch;
 mod request;
 pub mod resource_plan;
 mod response;
 mod sampler;
 mod scheduler;
 mod sequence;
+mod special_text;
 pub mod speculative;
 mod speech_models;
 mod toml_selector;
@@ -142,6 +145,7 @@ pub use files::{
     WIRE_EMBED_LIMIT_BYTES,
 };
 pub use gguf::{GGUFArchitecture, GGUF_MULTI_FILE_DELIMITER};
+pub use memory_plan::{ExecutionMemoryLimits, MemoryGoal};
 pub use mistralrs_audio::AudioInput;
 pub use mistralrs_code_exec::{
     CodeExecutionApproval, CodeExecutionApprovalCallback, CodeExecutionConfig, ShellConfig,
@@ -159,7 +163,7 @@ pub use mistralrs_mcp::{
 };
 pub use mistralrs_quant::{IsqBits, IsqType};
 pub use mistralrs_sandbox::{NetworkMode, SandboxPolicy};
-pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
+pub use paged_attention::{PagedAttentionConfig, PagedCacheType};
 pub use pipeline::hf::{
     get_model_file, hf_home_dir, hf_hub_cache_dir, hf_token_path, is_hf_hub_offline,
     list_model_files, probe_hf_repo_files, read_model_file_range, try_get_model_file,
@@ -168,8 +172,9 @@ pub use pipeline::hf::{
 pub use pipeline::{
     chat_template::{is_chat_template_request_error, ChatTemplate},
     expand_isq_value, expand_uqff_shards, parse_isq_value, parse_uqff_shard,
-    resolve_uqff_report_output, resolve_uqff_shorthand, AdapterPaths, AnyMoeLoader, AnyMoePipeline,
-    AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, DiffusionGenerationParams, DiffusionLoader,
+    resolve_uqff_report_output, resolve_uqff_shorthand, ActivationMemoryContext,
+    ActivationMemoryEstimate, AdapterPaths, AnyMoeLoader, AnyMoePipeline, AutoDeviceMapParams,
+    AutoLoader, AutoLoaderBuilder, DiffusionGenerationParams, DiffusionLoader,
     DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader, EmbeddingLoaderBuilder,
     EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig, GGMLLoader,
     GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig,
@@ -1584,11 +1589,11 @@ impl MistralRs {
             tool_callbacks,
         };
 
+        let pipeline_name = pipeline.lock().await.name();
         let engine_instance =
             Self::create_engine_instance(pipeline.clone(), method, engine_config, reboot_state)
                 .expect("Failed to create engine instance");
 
-        let pipeline_name = pipeline.try_lock().unwrap().name();
         let (id, alias_map) = match model_id_override {
             Some(override_id) => {
                 let mut alias_map = HashMap::new();
@@ -2758,7 +2763,7 @@ impl MistralRs {
                 loader_config.silent,
                 loader_config.device_map_setting.clone(),
                 loader_config.isq,
-                loader_config.paged_attn_config,
+                loader_config.paged_attn_config.clone(),
             )
             .map_err(|e| MistralRsError::ReloadFailed(format!("Failed to load model: {e}")))?;
 

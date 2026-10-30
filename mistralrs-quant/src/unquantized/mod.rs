@@ -96,6 +96,11 @@ impl UnquantLinear {
 }
 
 impl QuantMethod for UnquantLinear {
+    #[cfg(feature = "metal")]
+    fn prepare_metal_kernels(&self, _activation_dtype: DType) -> Result<()> {
+        crate::metal_kernels::prepare_dense(&self.w)
+    }
+
     fn new(method: QuantMethodConfig) -> candle_core::Result<Self>
     where
         Self: Sized,
@@ -111,11 +116,16 @@ impl QuantMethod for UnquantLinear {
             | QuantMethodConfig::PerTensorFP8 { .. }
             | QuantMethodConfig::Afq { .. }
             | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
-            QuantMethodConfig::Unquantized(l) => Ok(Self {
-                w: l.weight().clone(),
-                b: l.bias().cloned(),
-                stats: ImatrixLayerStats::empty(),
-            }),
+            QuantMethodConfig::Unquantized(l) => {
+                let layer = Self {
+                    w: l.weight().clone(),
+                    b: l.bias().cloned(),
+                    stats: ImatrixLayerStats::empty(),
+                };
+                #[cfg(feature = "metal")]
+                layer.prepare_metal_kernels(layer.w.dtype())?;
+                Ok(layer)
+            }
         }
     }
 
@@ -141,6 +151,15 @@ impl QuantMethod for UnquantLinear {
         }
 
         self.stats.process(a)?;
+
+        #[cfg(feature = "cuda")]
+        if crate::gemv::should_use_wide_gemv(a, &self.w) {
+            let output = crate::gemv::gemv(a, &self.w, None)?;
+            return match self.b.as_ref() {
+                Some(bias) => output.broadcast_add(bias),
+                None => Ok(output),
+            };
+        }
 
         if a.device().is_cuda() && a.rank() > 2 {
             return self.forward_cuda_gemm(a);
@@ -201,7 +220,7 @@ impl QuantMethod for UnquantLinear {
                     #[cfg(not(feature = "accelerate"))]
                     {
                         let matmul_result = a.matmul(&w.t()?)?;
-                        matmul_result.broadcast_add(&b)
+                        crate::elementwise::broadcast_add(&matmul_result, &b)
                     }
                 }
             }
@@ -923,3 +942,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod wide_gemv_tests;

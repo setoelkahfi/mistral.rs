@@ -1,32 +1,23 @@
 #[cfg(feature = "cuda")]
 const CUTLASS_COMMIT: &str = "7127592069c2fe01b041e174ba4345ef9b279671";
 #[cfg(feature = "cuda")]
+const NVFP4_CUTLASS_COMMIT: &str = "b46b16d003484063bca4ed365e44095c4c6ed633";
+#[cfg(feature = "cuda")]
 const DEEPGEMM_CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
 #[cfg(feature = "cuda")]
 const CUTLASS_COMMIT_ENV: &str = "MISTRALRS_CUTLASS_COMMIT";
 #[cfg(feature = "cuda")]
 const CUDA_BUILD_ROOT_ENV: &str = "MISTRALRS_CUDA_BUILD_ROOT";
+
 #[cfg(feature = "cuda")]
-const SUPPORTED_CUDA_TOOLKIT_VERSIONS: &[(usize, usize)] = &[
-    (13, 3),
-    (13, 2),
-    (13, 1),
-    (13, 0),
-    (12, 9),
-    (12, 8),
-    (12, 6),
-    (12, 5),
-    (12, 4),
-    (12, 3),
-    (12, 2),
-    (12, 1),
-    (12, 0),
-    (11, 8),
-    (11, 7),
-    (11, 6),
-    (11, 5),
-    (11, 4),
-];
+#[path = "src/build_support/cuda_toolkit.rs"]
+mod cuda_toolkit;
+
+#[cfg(feature = "cuda")]
+use cuda_toolkit::{
+    nvfp4_cutlass_supported_for_build, parse_cuda_version_from_nvcc,
+    SUPPORTED_CUDA_TOOLKIT_VERSIONS,
+};
 
 #[cfg(feature = "cuda")]
 fn cuda_build_dir(out_dir: &std::path::Path, component: &str) -> std::path::PathBuf {
@@ -37,6 +28,19 @@ fn cuda_build_dir(out_dir: &std::path::Path, component: &str) -> std::path::Path
     let build_dir = std::path::PathBuf::from(root).join("quant").join(component);
     std::fs::create_dir_all(&build_dir).expect("failed to create shared CUDA build directory");
     build_dir
+}
+
+#[cfg(feature = "cuda")]
+fn prepare_cuda_archive(path: std::path::PathBuf) -> std::path::PathBuf {
+    if std::env::var_os(CUDA_BUILD_ROOT_ENV).is_some() {
+        // Shared objects can be newer than this Cargo build directory's archive.
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to refresh CUDA archive {}: {error}", path.display()),
+        }
+    }
+    path
 }
 
 #[cfg(feature = "cuda")]
@@ -96,18 +100,6 @@ fn cuda_version_from_build_system() -> (usize, usize) {
 }
 
 #[cfg(feature = "cuda")]
-fn parse_cuda_version_from_nvcc(stdout: &str) -> Option<(usize, usize)> {
-    let release = stdout.split("release ").nth(1)?;
-    let version = release
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .next()?;
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor))
-}
-
-#[cfg(feature = "cuda")]
 fn cutile_supported_for_build_cuda(major: usize, minor: usize, compute_cap: usize) -> bool {
     let cuda_code = major * 100 + minor;
     ((80..90).contains(&compute_cap) && cuda_code >= 1302)
@@ -126,6 +118,7 @@ fn main() -> Result<(), String> {
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_wmma_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_cutlass_moe_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_nvfp4_cutlass_sm121_kernels)");
     println!("cargo::rustc-check-cfg=cfg(cuda_ge_13000)");
 
     #[cfg(feature = "cuda")]
@@ -229,6 +222,7 @@ fn main() -> Result<(), String> {
         if !cutlass_fp8_sm90 {
             excluded_files.push("*_cutlass_sm90.cu");
         }
+        excluded_files.push("nvfp4_cutlass.cu");
         builder = builder.exclude(&excluded_files);
         let cutlass_commit =
             std::env::var(CUTLASS_COMMIT_ENV).unwrap_or_else(|_| CUTLASS_COMMIT.to_string());
@@ -253,7 +247,7 @@ fn main() -> Result<(), String> {
             out_dir.join("libmistralrsquant.a")
         };
         builder
-            .build_lib(out_file)
+            .build_lib(prepare_cuda_archive(out_file))
             .expect("Build mistral quant lib failed!");
         if deepgemm_fp8_sm90 {
             let deepgemm_source_hash_arg =
@@ -273,8 +267,43 @@ fn main() -> Result<(), String> {
                     .arg(cuda_nvcc_flags_env);
             }
             deepgemm_builder
-                .build_lib(out_dir.join("libmistralrsdeepgemm.a"))
+                .build_lib(prepare_cuda_archive(out_dir.join("libmistralrsdeepgemm.a")))
                 .expect("Build mistral DeepGEMM provider failed!");
+        }
+        if nvfp4_cutlass_supported_for_build(
+            (cuda_major, cuda_minor),
+            compute_cap,
+            cfg!(feature = "cutile"),
+            &target,
+        ) {
+            let nvfp4_build_dir = cuda_build_dir(&out_dir, "nvfp4-cutlass");
+            let nvfp4_cutlass_commit = std::env::var(CUTLASS_COMMIT_ENV)
+                .unwrap_or_else(|_| NVFP4_CUTLASS_COMMIT.to_string());
+            let mut nvfp4_builder = cudaforge::KernelBuilder::new()
+                .out_dir(&nvfp4_build_dir)
+                .source_files(["kernels/nvfp4_cutlass/nvfp4_cutlass.cu"])
+                .watch(["kernels/nvfp4_cutlass"])
+                .compute_cap_arch("121a")
+                .with_compute_override_arch("nvfp4_cutlass.cu", "121a")
+                .arg("-std=c++17")
+                .arg("-O3")
+                .arg("--expt-relaxed-constexpr")
+                .arg("--expt-extended-lambda")
+                .arg("--fmad=false")
+                .arg("--compiler-options")
+                .arg("-fPIC")
+                .arg(&header_hash_arg)
+                .with_cutlass(Some(&nvfp4_cutlass_commit));
+            if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
+                nvfp4_builder = nvfp4_builder
+                    .arg("--compiler-options")
+                    .arg(cuda_nvcc_flags_env);
+            }
+            nvfp4_builder
+                .build_lib(prepare_cuda_archive(out_dir.join("libmistralrsnvfp4.a")))
+                .expect("Build mistral NVFP4 provider failed!");
+            println!("cargo:rustc-cfg=has_nvfp4_cutlass_sm121_kernels");
+            println!("cargo:rustc-link-lib=mistralrsnvfp4");
         }
         println!("cargo:rustc-link-search={}", out_dir.display());
         println!("cargo:rustc-link-lib=mistralrsquant");
